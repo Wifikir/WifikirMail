@@ -1,0 +1,25 @@
+[Unit]
+Description=WifikirMail Transactional Email Service
+After=network.target postgresql.service postfix.service
+Requires=postgresql.service postfix.service
+
+[Service]
+Type=simple
+User=wifikirmail
+Group=wifikirmail
+WorkingDirectory=/opt/wifikir-mail
+Environment="RUST_LOG=wifikir_mail=info"
+EnvironmentFile=/etc/wifikir-mail/wifikir-mail.env
+ExecStart=/opt/wifikir-mail/wifikir_mail
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/wifikir-mail
+
+[Install]
+WantedBy=multi-user.target
