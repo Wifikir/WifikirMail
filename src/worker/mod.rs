@@ -6,27 +6,43 @@ use sqlx::PgPool;
 use std::time::Duration;
 use tokio::time;
 use tracing::{error, info};
+use uuid::Uuid;
 
 use crate::config::Config;
-use crate::db::{get_pending_jobs, update_job_failed, update_job_submitted};
+use crate::db::{claim_pending_jobs, recover_expired_leases, update_job_failed, update_job_submitted};
 use crate::templates::render_template;
 
 pub struct EmailWorker {
     pool: PgPool,
     config: Config,
+    worker_id: String,
 }
 
 impl EmailWorker {
     pub fn new(pool: PgPool, config: Config) -> Self {
-        Self { pool, config }
+        let worker_id = format!("worker-{}", Uuid::new_v4());
+        info!("Email worker created with id: {}", worker_id);
+        Self { pool, config, worker_id }
     }
 
     pub async fn run(&self) {
         info!("Email worker started");
+        
+        if let Err(e) = recover_expired_leases(&self.pool).await {
+            error!("Failed to recover expired leases on startup: {}", e);
+        } else {
+            info!("Recovered expired leases on startup");
+        }
+
         let mut interval = time::interval(Duration::from_secs(self.config.worker_interval_secs));
 
         loop {
             interval.tick().await;
+            
+            if let Err(e) = recover_expired_leases(&self.pool).await {
+                error!("Failed to recover expired leases: {}", e);
+            }
+            
             if let Err(e) = self.process_pending_jobs().await {
                 error!("Error processing pending jobs: {}", e);
             }
@@ -34,13 +50,19 @@ impl EmailWorker {
     }
 
     async fn process_pending_jobs(&self) -> Result<()> {
-        let jobs = get_pending_jobs(&self.pool, 10).await?;
+        let jobs = claim_pending_jobs(
+            &self.pool,
+            &self.worker_id,
+            10,
+            self.config.job_lease_duration_secs,
+        )
+        .await?;
 
         if jobs.is_empty() {
             return Ok(());
         }
 
-        info!("Processing {} pending jobs", jobs.len());
+        info!("Claimed and processing {} jobs", jobs.len());
 
         for job in jobs {
             if let Err(e) = self.send_email(&job).await {
@@ -55,10 +77,10 @@ impl EmailWorker {
     }
 
     async fn send_email(&self, job: &crate::db::EmailJob) -> Result<()> {
-        let template = render_template(&job.template_key, &job.reference_id)?;
+        let template = render_template(&job.template_key, job.template_data.as_ref())?;
 
         let email = Message::builder()
-            .from("noreply@wifikir.com".parse()?)
+            .from(self.config.mail_from.parse()?)
             .to(job.recipient.parse()?)
             .subject(&template.subject)
             .body(template.body)?;

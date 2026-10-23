@@ -1,30 +1,36 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    Json,
+    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::auth::{validate_email, validate_template_key};
-use crate::db::{create_email_job, get_email_job};
+use crate::db::{create_email_job, get_email_job_by_api_key};
 
 use super::AppState;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateEmailRequest {
     pub recipient: String,
     pub template_key: String,
     pub reference_id: String,
+    pub idempotency_key: Option<String>,
+    pub template_data: Option<JsonValue>,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateEmailResponse {
     pub job_id: Uuid,
     pub status: String,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EmailJobResponse {
     pub id: Uuid,
     pub recipient: String,
@@ -55,8 +61,29 @@ pub async fn health() -> Json<HealthResponse> {
     })
 }
 
+pub async fn ready(
+    State(state): State<AppState>,
+) -> Result<Json<HealthResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match sqlx::query("SELECT 1").execute(&state.pool).await {
+        Ok(_) => Ok(Json(HealthResponse {
+            status: "ready".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })),
+        Err(e) => {
+            tracing::error!("Database health check failed: {}", e);
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "Database not available".to_string(),
+                }),
+            ))
+        }
+    }
+}
+
 pub async fn create_email(
     State(state): State<AppState>,
+    Extension(api_key_id): Extension<Uuid>,
     Json(payload): Json<CreateEmailRequest>,
 ) -> Result<(StatusCode, Json<CreateEmailResponse>), (StatusCode, Json<ErrorResponse>)> {
     if !validate_email(&payload.recipient) {
@@ -88,9 +115,12 @@ pub async fn create_email(
 
     match create_email_job(
         &state.pool,
+        api_key_id,
         &payload.recipient,
         &payload.template_key,
         &payload.reference_id,
+        payload.idempotency_key.as_deref(),
+        payload.template_data.as_ref(),
     )
     .await
     {
@@ -102,6 +132,16 @@ pub async fn create_email(
             }),
         )),
         Err(e) => {
+            let error_msg = e.to_string();
+            if error_msg.contains("Idempotency key conflict") {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: "Idempotency key already used with different content".to_string(),
+                    }),
+                ));
+            }
+            
             tracing::error!("Failed to create email job: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -115,9 +155,10 @@ pub async fn create_email(
 
 pub async fn get_email_status(
     State(state): State<AppState>,
+    Extension(api_key_id): Extension<Uuid>,
     Path(job_id): Path<Uuid>,
 ) -> Result<Json<EmailJobResponse>, (StatusCode, Json<ErrorResponse>)> {
-    match get_email_job(&state.pool, job_id).await {
+    match get_email_job_by_api_key(&state.pool, api_key_id, job_id).await {
         Ok(Some(job)) => Ok(Json(EmailJobResponse {
             id: job.id,
             recipient: job.recipient,

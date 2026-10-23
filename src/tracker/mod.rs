@@ -1,58 +1,108 @@
 use anyhow::Result;
 use regex::Regex;
 use sqlx::PgPool;
-use std::process::Stdio;
+use std::path::Path;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::fs;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::db::{update_job_status_by_queue_id, EmailJobStatus};
 
+const CURSOR_FILE: &str = "/var/lib/wifikir-mail/mail.log.cursor";
+const MAX_BACKOFF_SECS: u64 = 300;
+
 pub struct StatusTracker {
     pool: PgPool,
-    config: Config,
+    backoff_secs: u64,
 }
 
 impl StatusTracker {
-    pub fn new(pool: PgPool, config: Config) -> Self {
-        Self { pool, config }
+    pub fn new(pool: PgPool, _config: Config) -> Self {
+        Self {
+            pool,
+            backoff_secs: 1,
+        }
     }
 
-    pub async fn run(&self) {
-        info!("Status tracker started");
-        
+    pub async fn run(mut self) {
+        info!("Status tracker started, monitoring /var/log/mail.log");
+
         loop {
-            if let Err(e) = self.monitor_postfix_logs().await {
-                error!("Error monitoring Postfix logs: {}", e);
-                time::sleep(Duration::from_secs(self.config.tracker_poll_interval_secs)).await;
+            match self.monitor_postfix_logs().await {
+                Ok(_) => {
+                    warn!("Log monitoring ended normally, restarting");
+                    self.backoff_secs = 1;
+                }
+                Err(e) => {
+                    error!(
+                        "Error monitoring Postfix logs: {}, retrying in {} seconds",
+                        e, self.backoff_secs
+                    );
+                    time::sleep(Duration::from_secs(self.backoff_secs)).await;
+                    self.backoff_secs = (self.backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                }
             }
         }
     }
 
-    async fn monitor_postfix_logs(&self) -> Result<()> {
-        let mut child = Command::new("journalctl")
-            .args([
-                "-u", "postfix@-",
-                "-f",
-                "--output=short-iso",
-                "-n", "0",
-            ])
-            .stdout(Stdio::piped())
-            .spawn()?;
+    async fn monitor_postfix_logs(&mut self) -> Result<()> {
+        let log_path = Path::new("/var/log/mail.log");
+        
+        let last_position = self.read_cursor().await.unwrap_or(0);
+        info!("Starting from position: {}", last_position);
 
-        let stdout = child.stdout.take().expect("Failed to capture stdout");
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-
-        while let Some(line) = lines.next_line().await? {
-            if let Err(e) = self.process_log_line(&line).await {
-                warn!("Error processing log line: {}", e);
-            }
+        let file = fs::File::open(log_path).await?;
+        let mut file = file;
+        
+        if last_position > 0 {
+            use tokio::io::AsyncSeekExt;
+            file.seek(std::io::SeekFrom::Start(last_position)).await?;
         }
 
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        let mut current_position = last_position;
+
+        loop {
+            match lines.next_line().await? {
+                Some(line) => {
+                    current_position += line.len() as u64 + 1;
+                    
+                    if let Err(e) = self.process_log_line(&line).await {
+                        warn!("Error processing log line: {}", e);
+                    }
+                    
+                    if let Err(e) = self.save_cursor(current_position).await {
+                        warn!("Failed to save cursor position: {}", e);
+                    }
+                }
+                None => {
+                    time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    async fn read_cursor(&self) -> Result<u64> {
+        let content = fs::read_to_string(CURSOR_FILE).await?;
+        Ok(content.trim().parse()?)
+    }
+
+    async fn save_cursor(&self, position: u64) -> Result<()> {
+        if let Some(parent) = Path::new(CURSOR_FILE).parent() {
+            fs::create_dir_all(parent).await.ok();
+        }
+        
+        let tmp_file = format!("{}.tmp", CURSOR_FILE);
+        let mut file = fs::File::create(&tmp_file).await?;
+        file.write_all(position.to_string().as_bytes()).await?;
+        file.sync_all().await?;
+        drop(file);
+        
+        fs::rename(&tmp_file, CURSOR_FILE).await?;
         Ok(())
     }
 
@@ -67,7 +117,7 @@ impl StatusTracker {
 
 pub fn parse_postfix_log_line(line: &str) -> Option<(String, String)> {
     let re = Regex::new(
-        r"postfix/(?:smtp|local|virtual)/[^:]+: ([A-F0-9]+): .* status=(sent|deferred|bounced)"
+        r"postfix/(?:smtp|local|virtual)\[\d+\]:\s+([A-F0-9]+):\s+.*\s+status=(sent|deferred|bounced)"
     ).ok()?;
 
     if let Some(captures) = re.captures(line) {
@@ -93,7 +143,7 @@ mod tests {
 
     #[test]
     fn test_parse_postfix_log_line_sent() {
-        let line = "2024-10-23T10:30:45+0000 mail postfix/smtp/smtp[12345]: 3F4A5B6C7D: to=<user@example.com>, relay=mail.example.com[1.2.3.4]:25, delay=0.5, status=sent (250 OK)";
+        let line = "Oct 23 10:30:45 mail postfix/smtp[12345]: 3F4A5B6C7D: to=<user@example.com>, relay=mail.example.com[1.2.3.4]:25, delay=0.5, delays=0.01/0.02/0.03/0.44, dsn=2.0.0, status=sent (250 2.0.0 OK)";
         let result = parse_postfix_log_line(line);
         assert!(result.is_some());
         let (queue_id, status) = result.unwrap();
@@ -103,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_parse_postfix_log_line_deferred() {
-        let line = "2024-10-23T10:30:45+0000 mail postfix/smtp/smtp[12345]: ABC123DEF456: to=<user@example.com>, relay=mail.example.com[1.2.3.4]:25, delay=0.5, status=deferred (temporary failure)";
+        let line = "Oct 23 10:30:45 mail postfix/smtp[12345]: ABC123DEF456: to=<user@example.com>, relay=mail.example.com[1.2.3.4]:25, delay=0.5, delays=0.01/0.02/0.03/0.44, dsn=4.4.1, status=deferred (connect to mail.example.com[1.2.3.4]:25: Connection refused)";
         let result = parse_postfix_log_line(line);
         assert!(result.is_some());
         let (queue_id, status) = result.unwrap();
@@ -113,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_parse_postfix_log_line_bounced() {
-        let line = "2024-10-23T10:30:45+0000 mail postfix/smtp/smtp[12345]: 9876543210AB: to=<user@example.com>, relay=none, status=bounced (Host not found)";
+        let line = "Oct 23 10:30:45 mail postfix/smtp[12345]: 9876543210AB: to=<user@example.com>, relay=mail.example.com[1.2.3.4]:25, delay=0.5, delays=0.01/0.02/0.03/0.44, dsn=5.1.1, status=bounced (host mail.example.com[1.2.3.4] said: 550 5.1.1 User unknown)";
         let result = parse_postfix_log_line(line);
         assert!(result.is_some());
         let (queue_id, status) = result.unwrap();
@@ -130,11 +180,28 @@ mod tests {
 
     #[test]
     fn test_parse_postfix_log_line_local_delivery() {
-        let line = "2024-10-23T10:30:45+0000 mail postfix/local/local[12345]: DEADBEEF123: to=<local@localhost>, status=sent (delivered to mailbox)";
+        let line = "Oct 23 10:30:45 mail postfix/local[54321]: DEADBEEF123: to=<local@localhost>, relay=local, delay=0.02, delays=0.01/0/0/0.01, dsn=2.0.0, status=sent (delivered to mailbox)";
         let result = parse_postfix_log_line(line);
         assert!(result.is_some());
         let (queue_id, status) = result.unwrap();
         assert_eq!(queue_id, "DEADBEEF123");
         assert_eq!(status, "AcceptedByRecipientServer");
+    }
+
+    #[test]
+    fn test_parse_postfix_log_line_virtual_delivery() {
+        let line = "Oct 23 10:30:45 mail postfix/virtual[98765]: ABCDEF12345: to=<user@virtual.example.com>, relay=virtual, delay=0.03, delays=0.01/0/0/0.02, dsn=2.0.0, status=sent (delivered to maildir)";
+        let result = parse_postfix_log_line(line);
+        assert!(result.is_some());
+        let (queue_id, status) = result.unwrap();
+        assert_eq!(queue_id, "ABCDEF12345");
+        assert_eq!(status, "AcceptedByRecipientServer");
+    }
+
+    #[test]
+    fn test_parse_postfix_log_line_without_status() {
+        let line = "Oct 23 10:30:45 mail postfix/smtp[12345]: 3F4A5B6C7D: to=<user@example.com>, relay=mail.example.com[1.2.3.4]:25, delay=0.5";
+        let result = parse_postfix_log_line(line);
+        assert!(result.is_none());
     }
 }

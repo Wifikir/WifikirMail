@@ -7,6 +7,7 @@ use uuid::Uuid;
 #[sqlx(type_name = "text")]
 pub enum EmailJobStatus {
     Pending,
+    Processing,
     SubmittedToMta,
     Deferred,
     AcceptedByRecipientServer,
@@ -18,6 +19,7 @@ impl std::fmt::Display for EmailJobStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EmailJobStatus::Pending => write!(f, "Pending"),
+            EmailJobStatus::Processing => write!(f, "Processing"),
             EmailJobStatus::SubmittedToMta => write!(f, "SubmittedToMta"),
             EmailJobStatus::Deferred => write!(f, "Deferred"),
             EmailJobStatus::AcceptedByRecipientServer => write!(f, "AcceptedByRecipientServer"),
@@ -33,6 +35,7 @@ impl std::str::FromStr for EmailJobStatus {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "Pending" => Ok(EmailJobStatus::Pending),
+            "Processing" => Ok(EmailJobStatus::Processing),
             "SubmittedToMta" => Ok(EmailJobStatus::SubmittedToMta),
             "Deferred" => Ok(EmailJobStatus::Deferred),
             "AcceptedByRecipientServer" => Ok(EmailJobStatus::AcceptedByRecipientServer),
@@ -56,6 +59,11 @@ pub struct EmailJob {
     pub submitted_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+    pub worker_id: Option<String>,
+    pub locked_until: Option<DateTime<Utc>>,
+    pub api_key_id: Option<Uuid>,
+    pub idempotency_key: Option<String>,
+    pub template_data: Option<sqlx::types::JsonValue>,
 }
 
 #[derive(Debug, Clone, FromRow)]

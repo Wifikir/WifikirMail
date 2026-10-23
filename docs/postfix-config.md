@@ -112,8 +112,13 @@ default._domainkey.wifikir.com. IN TXT "v=DKIM1; k=rsa; p=MIGfMA0GCS..."
 
 ## DMARC Politikası
 
-DNS'e DMARC kaydı ekleyin:
+DNS'e DMARC kaydı ekleyin. **Başlangıçta `p=none` kullanın** (sadece raporlama) ve SPF/DKIM doğrulandıktan sonra `quarantine` veya `reject`'e geçin:
 
+```
+_dmarc.wifikir.com. IN TXT "v=DMARC1; p=none; rua=mailto:dmarc-reports@wifikir.com; pct=100; adkim=s; aspf=s"
+```
+
+SPF ve DKIM düzgün çalıştığını doğruladıktan sonra:
 ```
 _dmarc.wifikir.com. IN TXT "v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@wifikir.com; pct=100; adkim=s; aspf=s"
 ```
@@ -128,15 +133,14 @@ Sunucunuzun IP adresi için PTR kaydının mail.wifikir.com'a işaret ettiğinde
 
 ## Postfix Loglarını İzleme
 
-WifikirMail, Postfix loglarını journald üzerinden izler:
+WifikirMail, Postfix loglarını `/var/log/mail.log` üzerinden izler:
 
 ```bash
 # Manuel log izleme
-journalctl -u postfix@- -f
-
-# veya klasik log dosyası
 tail -f /var/log/mail.log
 ```
+
+**Not:** WifikirMail `/var/log/mail.log` dosyasını takip eder ve okuma pozisyonunu `/var/lib/wifikir-mail/mail.log.cursor` dosyasında saklar. Bu sayede servis yeniden başlatıldığında log takibi kaybolmaz.
 
 ## Test
 
@@ -157,11 +161,15 @@ echo "Test" | mail -s "Test" test@example.com
 
 Bu üç durum farklıdır! WifikirMail sadece 1 ve 2'yi takip edebilir. Son kullanıcının mesajı görüp görmediğini bilmek için ayrı bir mekanizma (örn: tracking pixel) gerekir.
 
-## Bounce Handling (Gelecek)
+## Bounce Handling (Faz 2)
 
-VERP (Variable Envelope Return Path) kullanarak bounce'ları otomatik işlemek için:
+**Şu anki durum:** WifikirMail Postfix loglarından `status=bounced` satırlarını yakalar ve işi `Bounced` olarak işaretler. Bu SMTP seviyesindeki immediate bounce'ları (5xx hatalar) kapsar.
 
-- Return-Path: bounce+{job_id}@wifikir.com
+**Kapsanmayanlar:**
+- Asynchronous bounce mesajları (alıcı sunucu e-postayı kabul edip sonradan geri gönderdiğinde)
+- Soft bounce sonrası final failure (Postfix deferred'dan sonra vazgeçtiğinde)
+
+**Faz 2 için planlanan:** VERP (Variable Envelope Return Path):
+- Return-Path: `bounce+{job_id}@wifikir.com`
 - Bounce mailbox'ı izle ve gelen bounce'ları job_id'ye göre eşle
-
-Bu özellik şu an stub olarak bırakılmıştır.
+- Asynchronous bounce'ları da yakala

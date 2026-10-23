@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
-use minijinja::{context, Environment};
+use minijinja::Environment;
+use serde_json::Value as JsonValue;
 
 pub struct EmailTemplate {
     pub subject: String,
     pub body: String,
 }
 
-pub fn render_template(template_key: &str, reference_id: &str) -> Result<EmailTemplate> {
+pub fn render_template(template_key: &str, template_data: Option<&JsonValue>) -> Result<EmailTemplate> {
     let mut env = Environment::new();
 
     match template_key {
@@ -55,7 +56,7 @@ Wifikir Ekibi
             )?;
         }
         "Notification" => {
-            env.add_template("subject", "Wifikir Bildirimi")?;
+            env.add_template("subject", "{{ subject }}")?;
             env.add_template(
                 "body",
                 r#"
@@ -63,7 +64,7 @@ Merhaba,
 
 Wifikir platformunda sizin için yeni bir bildirim var.
 
-Bildirim: {{ message }}
+{{ message }}
 
 Detaylar için lütfen hesabınıza giriş yapın.
 
@@ -78,16 +79,14 @@ Wifikir Ekibi
     let subject_tmpl = env.get_template("subject")?;
     let body_tmpl = env.get_template("body")?;
 
-    let ctx = context! {
-        verification_code => reference_id,
-        reset_code => reference_id,
-        message => reference_id,
-    };
+    let data = template_data
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow::anyhow!("Template data is required"))?;
 
     let subject = subject_tmpl
-        .render(&ctx)
+        .render(data)
         .context("Failed to render subject")?;
-    let body = body_tmpl.render(&ctx).context("Failed to render body")?;
+    let body = body_tmpl.render(data).context("Failed to render body")?;
 
     Ok(EmailTemplate { subject, body })
 }
@@ -95,10 +94,14 @@ Wifikir Ekibi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_render_email_verification() {
-        let result = render_template("EmailVerification", "ABC123");
+        let data = json!({
+            "verification_code": "ABC123"
+        });
+        let result = render_template("EmailVerification", Some(&data));
         assert!(result.is_ok());
         let template = result.unwrap();
         assert!(template.subject.contains("Doğrulayın"));
@@ -107,7 +110,10 @@ mod tests {
 
     #[test]
     fn test_render_password_reset() {
-        let result = render_template("PasswordReset", "XYZ789");
+        let data = json!({
+            "reset_code": "XYZ789"
+        });
+        let result = render_template("PasswordReset", Some(&data));
         assert!(result.is_ok());
         let template = result.unwrap();
         assert!(template.subject.contains("Şifre"));
@@ -116,16 +122,29 @@ mod tests {
 
     #[test]
     fn test_render_notification() {
-        let result = render_template("Notification", "Test mesajı");
+        let data = json!({
+            "subject": "Önemli Bildirim",
+            "message": "Test mesajı"
+        });
+        let result = render_template("Notification", Some(&data));
         assert!(result.is_ok());
         let template = result.unwrap();
-        assert!(template.subject.contains("Bildirim"));
+        assert!(template.subject.contains("Önemli"));
         assert!(template.body.contains("Test mesajı"));
     }
 
     #[test]
     fn test_unknown_template() {
-        let result = render_template("Unknown", "test");
+        let data = json!({
+            "test": "data"
+        });
+        let result = render_template("Unknown", Some(&data));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_missing_template_data() {
+        let result = render_template("EmailVerification", None);
         assert!(result.is_err());
     }
 }

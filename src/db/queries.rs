@@ -7,22 +7,59 @@ use super::models::{ApiKey, EmailJob, EmailJobStatus, EmailJobStatusHistory};
 
 pub async fn create_email_job(
     pool: &PgPool,
+    api_key_id: Uuid,
     recipient: &str,
     template_key: &str,
     reference_id: &str,
+    idempotency_key: Option<&str>,
+    template_data: Option<&sqlx::types::JsonValue>,
 ) -> Result<EmailJob> {
+    if let Some(idem_key) = idempotency_key {
+        if let Some(existing) = sqlx::query_as::<_, EmailJob>(
+            r#"
+            SELECT * FROM email_jobs
+            WHERE api_key_id = $1 AND idempotency_key = $2
+            "#,
+        )
+        .bind(api_key_id)
+        .bind(idem_key)
+        .fetch_optional(pool)
+        .await?
+        {
+            let existing_data_str = existing.template_data.as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let new_data_str = template_data
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            
+            if existing.recipient != recipient 
+                || existing.template_key != template_key 
+                || existing_data_str != new_data_str
+            {
+                anyhow::bail!("Idempotency key conflict: different content");
+            }
+            
+            return Ok(existing);
+        }
+    }
+
     let job = sqlx::query_as::<_, EmailJob>(
         r#"
-        INSERT INTO email_jobs (recipient, template_key, reference_id, status, attempt_count)
-        VALUES ($1, $2, $3, $4, 0)
-        ON CONFLICT (reference_id, template_key) DO UPDATE
-        SET recipient = EXCLUDED.recipient
+        INSERT INTO email_jobs (
+            api_key_id, recipient, template_key, reference_id, 
+            idempotency_key, template_data, status, attempt_count
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 0)
         RETURNING *
         "#,
     )
+    .bind(api_key_id)
     .bind(recipient)
     .bind(template_key)
     .bind(reference_id)
+    .bind(idempotency_key)
+    .bind(template_data)
     .bind(EmailJobStatus::Pending.to_string())
     .fetch_one(pool)
     .await?;
@@ -45,22 +82,88 @@ pub async fn get_email_job(pool: &PgPool, id: Uuid) -> Result<Option<EmailJob>> 
     Ok(job)
 }
 
-pub async fn get_pending_jobs(pool: &PgPool, limit: i64) -> Result<Vec<EmailJob>> {
+pub async fn get_email_job_by_api_key(
+    pool: &PgPool,
+    api_key_id: Uuid,
+    job_id: Uuid,
+) -> Result<Option<EmailJob>> {
+    let job = sqlx::query_as::<_, EmailJob>(
+        r#"
+        SELECT * FROM email_jobs WHERE id = $1 AND api_key_id = $2
+        "#,
+    )
+    .bind(job_id)
+    .bind(api_key_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(job)
+}
+
+pub async fn claim_pending_jobs(
+    pool: &PgPool,
+    worker_id: &str,
+    limit: i64,
+    lease_duration_secs: i64,
+) -> Result<Vec<EmailJob>> {
+    let mut tx = pool.begin().await?;
+    
+    let locked_until = Utc::now() + chrono::Duration::seconds(lease_duration_secs);
+    
     let jobs = sqlx::query_as::<_, EmailJob>(
         r#"
-        SELECT * FROM email_jobs
-        WHERE status = $1
-        ORDER BY created_at ASC
-        LIMIT $2
-        FOR UPDATE SKIP LOCKED
+        UPDATE email_jobs
+        SET status = $1, worker_id = $2, locked_until = $3
+        WHERE id IN (
+            SELECT id FROM email_jobs
+            WHERE status = $4
+            ORDER BY created_at ASC
+            LIMIT $5
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *
+        "#,
+    )
+    .bind(EmailJobStatus::Processing.to_string())
+    .bind(worker_id)
+    .bind(locked_until)
+    .bind(EmailJobStatus::Pending.to_string())
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    for job in &jobs {
+        sqlx::query(
+            r#"
+            INSERT INTO email_job_status_history (job_id, status)
+            VALUES ($1, $2)
+            "#,
+        )
+        .bind(job.id)
+        .bind(EmailJobStatus::Processing.to_string())
+        .execute(&mut *tx)
+        .await?;
+    }
+    
+    tx.commit().await?;
+    Ok(jobs)
+}
+
+pub async fn recover_expired_leases(pool: &PgPool) -> Result<usize> {
+    let result = sqlx::query(
+        r#"
+        UPDATE email_jobs
+        SET status = $1, worker_id = NULL, locked_until = NULL
+        WHERE status = $2 AND locked_until < $3
         "#,
     )
     .bind(EmailJobStatus::Pending.to_string())
-    .bind(limit)
-    .fetch_all(pool)
+    .bind(EmailJobStatus::Processing.to_string())
+    .bind(Utc::now())
+    .execute(pool)
     .await?;
 
-    Ok(jobs)
+    Ok(result.rows_affected() as usize)
 }
 
 pub async fn update_job_submitted(
@@ -178,6 +281,21 @@ pub async fn get_status_history(pool: &PgPool, job_id: Uuid) -> Result<Vec<Email
     .await?;
 
     Ok(history)
+}
+
+pub async fn count_pending_jobs(pool: &PgPool) -> Result<i64> {
+    let count: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM email_jobs
+        WHERE status IN ($1, $2)
+        "#,
+    )
+    .bind(EmailJobStatus::Pending.to_string())
+    .bind(EmailJobStatus::Processing.to_string())
+    .fetch_one(pool)
+    .await?;
+
+    Ok(count.0)
 }
 
 pub async fn verify_api_key(pool: &PgPool, key_hash: &str) -> Result<Option<ApiKey>> {

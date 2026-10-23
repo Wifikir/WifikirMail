@@ -19,6 +19,8 @@ pub use middleware::*;
 pub struct AppState {
     pub pool: PgPool,
     pub rate_limiter: RateLimiter,
+    pub global_rate_limiter: RateLimiter,
+    pub queue_capacity_limit: usize,
 }
 
 pub fn create_router(pool: PgPool, config: &Config) -> Router {
@@ -26,10 +28,17 @@ pub fn create_router(pool: PgPool, config: &Config) -> Router {
         config.rate_limit_per_minute as usize,
         Duration::from_secs(60),
     );
+    
+    let global_rate_limiter = RateLimiter::new(
+        config.rate_limit_global as usize,
+        Duration::from_secs(60),
+    );
 
     let state = AppState {
         pool,
         rate_limiter,
+        global_rate_limiter,
+        queue_capacity_limit: config.queue_capacity_limit,
     };
 
     let protected_routes = Router::new()
@@ -37,15 +46,16 @@ pub fn create_router(pool: PgPool, config: &Config) -> Router {
         .route("/v1/emails/:id", get(handlers::get_email_status))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
-            middleware::rate_limit_middleware,
+            middleware::auth_middleware,
         ))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
-            middleware::auth_middleware,
+            middleware::rate_limit_middleware,
         ));
 
     Router::new()
         .route("/health", get(handlers::health))
+        .route("/ready", get(handlers::ready))
         .merge(protected_routes)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
