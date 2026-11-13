@@ -19,7 +19,14 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/log/wifikir-mail
+
+# State directory for mail.log cursor (/var/lib/wifikir-mail)
+StateDirectory=wifikir-mail
+
+# Read access to Postfix logs (/var/log/mail.log).
+# The wifikirmail user must also be in the adm group:
+#   sudo usermod -aG adm wifikirmail
+SupplementaryGroups=adm
 
 [Install]
 WantedBy=multi-user.target

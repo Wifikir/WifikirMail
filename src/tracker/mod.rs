@@ -1,17 +1,20 @@
 use anyhow::Result;
 use regex::Regex;
 use sqlx::PgPool;
+use std::fs::Metadata;
 use std::path::Path;
 use std::time::Duration;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::time;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::db::{update_job_status_by_queue_id, EmailJobStatus};
 
+/// Cursor lives under StateDirectory=wifikir-mail (/var/lib/wifikir-mail).
 const CURSOR_FILE: &str = "/var/lib/wifikir-mail/mail.log.cursor";
+const LOG_PATH: &str = "/var/log/mail.log";
 const MAX_BACKOFF_SECS: u64 = 300;
 
 pub struct StatusTracker {
@@ -28,7 +31,7 @@ impl StatusTracker {
     }
 
     pub async fn run(mut self) {
-        info!("Status tracker started, monitoring /var/log/mail.log");
+        info!("Status tracker started, monitoring {}", LOG_PATH);
 
         loop {
             match self.monitor_postfix_logs().await {
@@ -49,76 +52,153 @@ impl StatusTracker {
     }
 
     async fn monitor_postfix_logs(&mut self) -> Result<()> {
-        let log_path = Path::new("/var/log/mail.log");
-        
-        let last_position = self.read_cursor().await.unwrap_or(0);
-        info!("Starting from position: {}", last_position);
+        let log_path = Path::new(LOG_PATH);
 
-        let file = fs::File::open(log_path).await?;
-        let mut file = file;
-        
-        if last_position > 0 {
-            use tokio::io::AsyncSeekExt;
-            file.seek(std::io::SeekFrom::Start(last_position)).await?;
-        }
+        let (last_position, last_inode) = self.read_cursor_with_inode().await.unwrap_or((0, 0));
+        info!(
+            "Starting from position: {}, inode: {}",
+            last_position, last_inode
+        );
+
+        let mut file = fs::File::open(log_path).await?;
+        let metadata = file.metadata().await?;
+        let current_inode = Self::get_inode(&metadata);
+
+        let mut current_position =
+            if current_inode == last_inode && last_position <= metadata.len() {
+                file.seek(std::io::SeekFrom::Start(last_position)).await?;
+                last_position
+            } else {
+                info!("Log file rotated or truncated, starting from beginning");
+                0
+            };
 
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
-        let mut current_position = last_position;
 
         loop {
-            match lines.next_line().await? {
-                Some(line) => {
-                    current_position += line.len() as u64 + 1;
-                    
-                    if let Err(e) = self.process_log_line(&line).await {
-                        warn!("Error processing log line: {}", e);
-                    }
-                    
-                    if let Err(e) = self.save_cursor(current_position).await {
-                        warn!("Failed to save cursor position: {}", e);
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let line_len = (line.len() + 1) as u64;
+
+                    // Advance cursor ONLY after a successful DB update.
+                    // Non-matching lines still advance; matching lines that fail DB do not.
+                    match self.process_log_line(&line).await {
+                        Ok(matched) => {
+                            current_position += line_len;
+                            if matched {
+                                if let Err(e) = self
+                                    .save_cursor_with_inode(current_position, current_inode)
+                                    .await
+                                {
+                                    error!("Failed to save cursor position: {}", e);
+                                }
+                            } else if current_position % 4096 < line_len {
+                                // Periodically persist progress for non-matching lines too.
+                                let _ = self
+                                    .save_cursor_with_inode(current_position, current_inode)
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            // Do NOT advance cursor — status would be lost.
+                            warn!(
+                                "DB update failed for log line at offset {}; cursor not advanced: {}",
+                                current_position, e
+                            );
+                            time::sleep(Duration::from_secs(1)).await;
+                        }
                     }
                 }
-                None => {
+                Ok(None) => {
+                    // Persist cursor at EOF so we don't re-scan on clean restart.
+                    let _ = self
+                        .save_cursor_with_inode(current_position, current_inode)
+                        .await;
+
                     time::sleep(Duration::from_millis(100)).await;
+
+                    match fs::metadata(log_path).await {
+                        Ok(new_metadata) => {
+                            let new_inode = Self::get_inode(&new_metadata);
+                            if new_inode != current_inode {
+                                info!("Log file rotated (inode changed), reopening");
+                                return Ok(());
+                            }
+                            if new_metadata.len() < current_position {
+                                info!("Log file truncated, reopening");
+                                return Ok(());
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to check log file metadata: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Error reading log line: {}", e);
+                    return Err(e.into());
                 }
             }
         }
     }
 
-    async fn read_cursor(&self) -> Result<u64> {
-        let content = fs::read_to_string(CURSOR_FILE).await?;
-        Ok(content.trim().parse()?)
+    #[cfg(unix)]
+    fn get_inode(metadata: &Metadata) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        metadata.ino()
     }
 
-    async fn save_cursor(&self, position: u64) -> Result<()> {
+    #[cfg(not(unix))]
+    fn get_inode(_metadata: &Metadata) -> u64 {
+        0
+    }
+
+    async fn read_cursor_with_inode(&self) -> Result<(u64, u64)> {
+        let content = fs::read_to_string(CURSOR_FILE).await?;
+        let parts: Vec<&str> = content.trim().split(',').collect();
+        if parts.len() == 2 {
+            Ok((parts[0].parse()?, parts[1].parse()?))
+        } else {
+            Ok((content.trim().parse()?, 0))
+        }
+    }
+
+    async fn save_cursor_with_inode(&self, position: u64, inode: u64) -> Result<()> {
         if let Some(parent) = Path::new(CURSOR_FILE).parent() {
             fs::create_dir_all(parent).await.ok();
         }
-        
+
         let tmp_file = format!("{}.tmp", CURSOR_FILE);
         let mut file = fs::File::create(&tmp_file).await?;
-        file.write_all(position.to_string().as_bytes()).await?;
+        let content = format!("{},{}", position, inode);
+        file.write_all(content.as_bytes()).await?;
         file.sync_all().await?;
         drop(file);
-        
+
         fs::rename(&tmp_file, CURSOR_FILE).await?;
         Ok(())
     }
 
-    async fn process_log_line(&self, line: &str) -> Result<()> {
+    /// Returns Ok(true) if a matching status line was applied to the DB.
+    async fn process_log_line(&self, line: &str) -> Result<bool> {
         if let Some((queue_id, status)) = parse_postfix_log_line(line) {
-            info!("Detected status change: queue_id={}, status={}", queue_id, status);
+            info!(
+                "Detected status change: queue_id={}, status={}",
+                queue_id, status
+            );
             update_job_status_by_queue_id(&self.pool, &queue_id, &status).await?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 }
 
 pub fn parse_postfix_log_line(line: &str) -> Option<(String, String)> {
     let re = Regex::new(
-        r"postfix/(?:smtp|local|virtual)\[\d+\]:\s+([A-F0-9]+):\s+.*\s+status=(sent|deferred|bounced)"
-    ).ok()?;
+        r"postfix/(?:smtp|local|virtual)\[\d+\]:\s+([A-F0-9]+):\s+.*\s+status=(sent|deferred|bounced)",
+    )
+    .ok()?;
 
     if let Some(captures) = re.captures(line) {
         let queue_id = captures.get(1)?.as_str().to_string();
@@ -174,8 +254,7 @@ mod tests {
     #[test]
     fn test_parse_postfix_log_line_invalid() {
         let line = "Some random log line without postfix status";
-        let result = parse_postfix_log_line(line);
-        assert!(result.is_none());
+        assert!(parse_postfix_log_line(line).is_none());
     }
 
     #[test]
@@ -201,7 +280,6 @@ mod tests {
     #[test]
     fn test_parse_postfix_log_line_without_status() {
         let line = "Oct 23 10:30:45 mail postfix/smtp[12345]: 3F4A5B6C7D: to=<user@example.com>, relay=mail.example.com[1.2.3.4]:25, delay=0.5";
-        let result = parse_postfix_log_line(line);
-        assert!(result.is_none());
+        assert!(parse_postfix_log_line(line).is_none());
     }
 }

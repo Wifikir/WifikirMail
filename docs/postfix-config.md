@@ -140,7 +140,11 @@ WifikirMail, Postfix loglarını `/var/log/mail.log` üzerinden izler:
 tail -f /var/log/mail.log
 ```
 
-**Not:** WifikirMail `/var/log/mail.log` dosyasını takip eder ve okuma pozisyonunu `/var/lib/wifikir-mail/mail.log.cursor` dosyasında saklar. Bu sayede servis yeniden başlatıldığında log takibi kaybolmaz.
+**Not:** WifikirMail `/var/log/mail.log` dosyasını takip eder ve okuma pozisyonunu (inode + offset) `/var/lib/wifikir-mail/mail.log.cursor` dosyasında saklar. Cursor yalnızca DB güncellemesi başarılı olduktan sonra ilerletilir. Logrotate sonrası inode değişimi veya truncation algılanır ve yeni dosyaya geçilir.
+
+**systemd erişimi:**
+- `StateDirectory=wifikir-mail` → `/var/lib/wifikir-mail` yazılabilir
+- `SupplementaryGroups=adm` + `usermod -aG adm wifikirmail` → `/var/log/mail.log` okunabilir
 
 ## Test
 

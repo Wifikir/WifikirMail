@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::auth::{validate_email, validate_template_key};
 use crate::db::{create_email_job, get_email_job_by_api_key};
+use crate::templates::render_template;
 
 use super::AppState;
 
@@ -18,8 +19,8 @@ pub struct CreateEmailRequest {
     pub recipient: String,
     pub template_key: String,
     pub reference_id: String,
-    pub idempotency_key: Option<String>,
-    pub template_data: Option<JsonValue>,
+    pub idempotency_key: String,
+    pub template_data: JsonValue,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,14 +114,33 @@ pub async fn create_email(
         ));
     }
 
+    if payload.idempotency_key.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "idempotencyKey is required".to_string(),
+            }),
+        ));
+    }
+
+    // Validate typed template data before enqueueing.
+    if let Err(e) = render_template(&payload.template_key, Some(&payload.template_data)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid templateData: {}", e),
+            }),
+        ));
+    }
+
     match create_email_job(
         &state.pool,
         api_key_id,
         &payload.recipient,
         &payload.template_key,
         &payload.reference_id,
-        payload.idempotency_key.as_deref(),
-        payload.template_data.as_ref(),
+        &payload.idempotency_key,
+        &payload.template_data,
     )
     .await
     {
@@ -141,7 +161,7 @@ pub async fn create_email(
                     }),
                 ));
             }
-            
+
             tracing::error!("Failed to create email job: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,

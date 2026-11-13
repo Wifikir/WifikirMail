@@ -4,272 +4,151 @@ Wifikir platformu için küçük, kaynak-verimli işlemsel e-posta servisi. Linu
 
 ## Mimari
 
-WifikirMail, transactional e-posta gönderimi için üç ana bileşenden oluşur:
+WifikirMail üç ana bileşenden oluşur. **Token üretimi/doğrulaması Wifikir auth servisinin işidir**; WifikirMail yalnızca aldığı değerleri şablona yerleştirir.
 
 ### 1. HTTP API Servisi
 
 - Wifikir'dan gelen istekleri kabul eder (e-posta doğrulama, şifre sıfırlama, bildirimler)
-- Şablonları render eder
-- Token üretir ve doğrular
+- Typed `templateData` ile şablonları render eder / doğrular
 - İşleri ve durumlarını PostgreSQL'de saklar
-- API key kimlik doğrulama ve rate limiting sağlar
-- Idempotency (reference_id + template_key) ile çift gönderimi önler
+- API key kimlik doğrulama, iki katmanlı rate limiting ve kuyruk kapasite limiti
+- Idempotency: zorunlu `idempotencyKey`, kapsam `(api_key_id, idempotency_key)`
 
 **Endpoints:**
-- `GET /health` - Sağlık kontrolü
-- `POST /v1/emails` - Yeni e-posta işi oluştur (202 Accepted döner)
-- `GET /v1/emails/:id` - İş durumunu sorgula
+- `GET /health` — liveness
+- `GET /ready` — DB connectivity
+- `POST /v1/emails` — yeni iş (202 Accepted; e-posta gönderildi iddiası değil)
+- `GET /v1/emails/:id` — iş durumu (api_key scoped)
 
 ### 2. Background Worker
 
-- PostgreSQL'den bekleyen işleri alır (SELECT ... FOR UPDATE SKIP LOCKED)
-- Şablonları render eder ve SMTP üzerinden localhost'taki Postfix'e gönderir
-- Postfix'in `250 ... queued as <ID>` yanıtından queue ID'yi kaydeder
-- Gönderim başarısızsa işi Failed olarak işaretler
+- PostgreSQL job kuyruğu (`SELECT ... FOR UPDATE SKIP LOCKED` + `Processing` lease)
+- SMTP handoff öncesi `Submitting` marker; lease mid-handoff biterse `Ambiguous` (kör resend yok)
+- Yerel Postfix'e SMTP; `250 ... queued as <ID>` kaydı
+- Retry politikası: bağlantı/4xx → exponential backoff (MAX_ATTEMPTS); 5xx/validation → Failed
 
 ### 3. Status Tracker
 
-- Postfix loglarını (journald veya /var/log/mail.log) takip eder
-- `status=sent|deferred|bounced` satırlarını arar
-- Postfix queue ID ile eşleşen işlerin durumunu günceller
+- `/var/log/mail.log` izler (inode + offset cursor: `/var/lib/wifikir-mail/mail.log.cursor`)
+- Cursor yalnızca DB güncellemesi başarılı olduktan sonra ilerler
+- Logrotate (inode/truncation) algılanır
+- `status=sent|deferred|bounced` satırlarını parse eder
 
-### Önemli Ayrımlar
+### Durum Ayrımları
 
-**DİKKAT:** Aşağıdaki üç durum birbirinden farklıdır:
+1. **Postfix mesajı kabul etti** → `SubmittedToMta`
+2. **Alıcı sunucu kabul etti** → `AcceptedByRecipientServer` (`status=sent`)
+3. **Inbox'a ulaştı** → **garanti edilemez**
 
-1. **Postfix mesajı kabul etti** → `SubmittedToMta` durumu
-2. **Alıcı sunucu mesajı kabul etti** → `AcceptedByRecipientServer` durumu (status=sent)
-3. **Mesaj kullanıcının inbox'una ulaştı** → Bu garanti EDİLEMEZ (spam/promotions klasörü)
-
-WifikirMail sadece 1. ve 2. durumu takip edebilir. E-postanın son kullanıcı tarafından görüldüğünü bilmek için ayrı tracking mekanizmaları gerekir.
+WifikirMail yalnızca 1 ve 2'yi (loglardan) gözlemleyebilir. Asynchronous bounce ve soft-bounce final failure **şu an kapsanmaz** (Faz 2: VERP).
 
 ### Postfix'in Rolü
 
-- **Postfix** MTA'dır ve delivery queue, retry ve bounce'ları yönetir
-- **Sadece loopback** (127.0.0.1:25) üzerinden dinler, asla açık relay değildir
-- **WifikirMail** sadece Postfix'e mesaj gönderir, kendi retry/queue mantığı YOKTUR
-- Postfix mesajı kabul etmezse (5xx), WifikirMail işi Failed olarak işaretler
+- Postfix MTA'dır; delivery queue, remote retry ve bounce ownership'i onda
+- Sadece loopback (`127.0.0.1:25`), açık relay değil
+- WifikirMail yalnızca Postfix'e handoff eder; remote delivery retry Postfix'tedir
 
 ## Veri Modeli
 
-### email_jobs Tablosu
+### email_jobs
 
-```sql
-- id (UUID, primary key)
-- recipient (VARCHAR)
-- template_key (VARCHAR): EmailVerification, PasswordReset, Notification
-- reference_id (VARCHAR): Doğrulama kodu, sıfırlama token'ı vb.
-- status (VARCHAR): Pending, SubmittedToMta, Deferred, AcceptedByRecipientServer, Bounced, Failed
-- postfix_queue_id (VARCHAR, nullable)
-- attempt_count (INTEGER)
-- created_at (TIMESTAMPTZ)
-- submitted_at (TIMESTAMPTZ, nullable)
-- completed_at (TIMESTAMPTZ, nullable)
-- last_error (TEXT, nullable)
+```
+id, api_key_id, recipient, template_key, reference_id,
+idempotency_key (required), template_data (JSONB),
+status, postfix_queue_id, attempt_count, next_attempt_at,
+worker_id, locked_until,
+created_at, submitted_at, completed_at, last_error
 ```
 
-**Unique constraint:** (reference_id, template_key) - Idempotency için
+**Statuses:** Pending, Processing, Submitting, SubmittedToMta, Deferred,
+AcceptedByRecipientServer, Bounced, Failed, Ambiguous
 
-### email_job_status_history Tablosu
+**Unique:** `(api_key_id, idempotency_key)`
 
-Her durum değişikliğini kaydeder:
-```sql
-- id (BIGSERIAL)
-- job_id (UUID, FK)
-- status (VARCHAR)
-- changed_at (TIMESTAMPTZ)
-- error_message (TEXT, nullable)
-- metadata (JSONB, nullable)
-```
+### email_job_status_history / api_keys
 
-### api_keys Tablosu
+Durum geçmişi ve SHA-256 hash'li API anahtarları.
 
-API key'leri SHA-256 hash olarak saklar:
-```sql
-- id (UUID)
-- key_hash (VARCHAR(64), unique)
-- name (VARCHAR)
-- created_at (TIMESTAMPTZ)
-- last_used_at (TIMESTAMPTZ, nullable)
-- is_active (BOOLEAN)
-```
+## Şablonlar (typed)
+
+| templateKey | Zorunlu templateData alanları |
+|---|---|
+| EmailVerification | `verification_code` |
+| PasswordReset | `reset_code` |
+| Notification | `subject`, `message` |
 
 ## Kurulum
 
 ### Gereksinimler
 
-- Rust 1.70+ (`cargo`)
+- Rust 1.70+
 - PostgreSQL 14+
-- Postfix (send-only, loopback yapılandırması)
-- Linux (systemd + journald)
+- Postfix (send-only, loopback)
+- Linux + systemd
 
-### 1. PostgreSQL Kurulumu
-
-```bash
-sudo apt install postgresql postgresql-contrib
-sudo -u postgres createuser wifikirmail
-sudo -u postgres createdb wifikir_mail -O wifikirmail
-sudo -u postgres psql -c "ALTER USER wifikirmail WITH PASSWORD 'güvenli_şifre';"
-```
-
-### 2. Postfix Kurulumu
-
-```bash
-sudo apt install postfix
-
-# "Internet Site" seçin ve hostname'i girin (örn: mail.wifikir.com)
-```
-
-Postfix yapılandırması için [`docs/postfix-config.md`](docs/postfix-config.md) dosyasına bakın.
-
-**Kritik:** Postfix'in sadece localhost'tan bağlantı kabul ettiğinden emin olun!
-
-### 3. WifikirMail Kurulumu
-
-```bash
-# Projeyi klonla
-git clone https://github.com/Wifikir/WifikirMail.git
-cd WifikirMail
-
-# Build
-cargo build --release
-
-# Binary'yi kopyala
-sudo mkdir -p /opt/wifikir-mail
-sudo cp target/release/wifikir_mail /opt/wifikir-mail/
-
-# Config dosyasını oluştur
-sudo mkdir -p /etc/wifikir-mail
-sudo cp .env.example /etc/wifikir-mail/wifikir-mail.env
-sudo nano /etc/wifikir-mail/wifikir-mail.env  # Ayarları düzenle
-```
-
-### 4. Systemd Servisi
+### Systemd
 
 ```bash
 sudo cp systemd/wifikir-mail.service /etc/systemd/system/
 sudo useradd -r -s /bin/false wifikirmail
+sudo usermod -aG adm wifikirmail   # /var/log/mail.log okuma
 sudo systemctl daemon-reload
-sudo systemctl enable wifikir-mail
-sudo systemctl start wifikir-mail
-sudo systemctl status wifikir-mail
+sudo systemctl enable --now wifikir-mail
 ```
 
-### 5. API Key Oluşturma
+Unit: `StateDirectory=wifikir-mail`, `SupplementaryGroups=adm`. Ayrıntılar: [`docs/postfix-config.md`](docs/postfix-config.md).
 
-```bash
-# PostgreSQL'e bağlan
-psql -U wifikirmail -d wifikir_mail
+### API Key (manuel — CLI sonraki PR)
 
-# API key oluştur (SHA-256 hash)
-INSERT INTO api_keys (key_hash, name) 
-VALUES (
-  encode(digest('sizin-gizli-api-key-burada', 'sha256'), 'hex'),
-  'Wifikir Ana Uygulama'
-);
+```sql
+INSERT INTO api_keys (key_hash, name)
+VALUES (encode(digest('sizin-gizli-api-key', 'sha256'), 'hex'), 'Wifikir');
 ```
 
-## API Kullanımı
-
-### E-posta Gönderme
+## API Örneği
 
 ```bash
 curl -X POST http://localhost:8080/v1/emails \
-  -H "Authorization: Bearer sizin-gizli-api-key-burada" \
+  -H "Authorization: Bearer sizin-gizli-api-key" \
   -H "Content-Type: application/json" \
   -d '{
     "recipient": "user@example.com",
     "templateKey": "EmailVerification",
-    "referenceId": "ABC123DEF456"
+    "referenceId": "order-or-user-ref",
+    "idempotencyKey": "verify-user-42-2024-10",
+    "templateData": { "verification_code": "ABC123" }
   }'
 ```
 
-**Yanıt (202 Accepted):**
-```json
-{
-  "job_id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "Pending"
-}
-```
+JSON alanları **camelCase**. Aynı `idempotencyKey` + aynı içerik → mevcut job; farklı içerik → 409.
 
-### Durum Sorgulama
+## Rate Limiting
 
-```bash
-curl http://localhost:8080/v1/emails/550e8400-e29b-41d4-a716-446655440000 \
-  -H "Authorization: Bearer sizin-gizli-api-key-burada"
-```
-
-**Yanıt:**
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "recipient": "user@example.com",
-  "template_key": "EmailVerification",
-  "reference_id": "ABC123DEF456",
-  "status": "AcceptedByRecipientServer",
-  "postfix_queue_id": "3F4A5B6C7D",
-  "created_at": "2024-10-23T10:30:00Z",
-  "submitted_at": "2024-10-23T10:30:05Z",
-  "completed_at": "2024-10-23T10:30:15Z"
-}
-```
-
-## E-posta Şablonları
-
-Mevcut şablonlar (Türkçe içerik):
-
-1. **EmailVerification** - E-posta doğrulama kodu
-2. **PasswordReset** - Şifre sıfırlama kodu
-3. **Notification** - Genel bildirimler
-
-Şablonlar `src/templates/mod.rs` içinde minijinja kullanılarak render edilir.
-
-## Güvenlik
-
-- API key'ler SHA-256 hash olarak saklanır
-- Rate limiting: Dakika başına 60 istek (varsayılan)
-- Idempotency: Aynı `(reference_id, template_key)` için tek e-posta
-- Postfix sadece localhost'tan bağlantı kabul eder
+- Per API key: `RATE_LIMIT_PER_MINUTE` (varsayılan 60)
+- Global: `RATE_LIMIT_GLOBAL` (varsayılan 1000)
+- Queue capacity: `QUEUE_CAPACITY_LIMIT` pending/processing → POST için 503
+- In-memory; tek instance için uygundur
 
 ## Geliştirme
 
 ```bash
-# Test
+cargo build
+cargo clippy -- -D warnings
 cargo test
-
-# Clippy
-cargo clippy
-
-# Format
-cargo fmt
-
-# Yerel çalıştırma (.env gerekli)
-cp .env.example .env
-cargo run
 ```
 
-## Bounce Handling (Gelecek İçin)
+## Bilinen Sınırlar / Sonraki PR'lar (production öncesi)
 
-Bounce'ları otomatik işlemek için iki seçenek:
+1. API key management CLI (create/list/revoke/rotate)
+2. Prometheus `/metrics` (localhost)
+3. File-based, version-controlled templates
+4. SMTP integration tests (test SMTP server, lease/cursor recovery)
+5. VERP / asynchronous bounce handling
 
-1. **VERP (Variable Envelope Return Path):**
-   - Return-Path: `bounce+{job_id}@wifikir.com`
-   - Bounce mailbox'ı izle ve job_id'ye göre işle
+## Bounce Handling (Faz 2)
 
-2. **Dedicated Bounce Mailbox:**
-   - IMAP/POP3 ile bounce@wifikir.com'u izle
-   - Message-ID veya custom header ile eşleştir
-
-Şu an stub olarak bırakılmıştır.
+Şu an yalnızca Postfix loglarındaki immediate `status=bounced` gözlemlenir. Asynchronous bounce ve soft-bounce final failure kapsanmaz.
 
 ## Lisans
 
 MIT
-
-## Katkıda Bulunma
-
-Pull request'ler memnuniyetle karşılanır. Büyük değişiklikler için önce bir issue açın.
-
-## İletişim
-
-Wifikir Ekibi - [https://wifikir.com](https://wifikir.com)

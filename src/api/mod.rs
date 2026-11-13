@@ -28,7 +28,7 @@ pub fn create_router(pool: PgPool, config: &Config) -> Router {
         config.rate_limit_per_minute as usize,
         Duration::from_secs(60),
     );
-    
+
     let global_rate_limiter = RateLimiter::new(
         config.rate_limit_global as usize,
         Duration::from_secs(60),
@@ -41,22 +41,43 @@ pub fn create_router(pool: PgPool, config: &Config) -> Router {
         queue_capacity_limit: config.queue_capacity_limit,
     };
 
-    let protected_routes = Router::new()
+    // In axum, the layer added LAST runs FIRST.
+    // Order of .layer() below (bottom → top of call stack):
+    //   1) auth_middleware (outermost — runs first)
+    //   2) rate_limit_middleware (sees api_key_id from extensions)
+    //   3) queue_capacity_middleware (POST only)
+
+    let post_route = Router::new()
         .route("/v1/emails", post(handlers::create_email))
-        .route("/v1/emails/:id", get(handlers::get_email_status))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
-            middleware::auth_middleware,
+            middleware::queue_capacity_middleware,
         ))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::rate_limit_middleware,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth_middleware,
+        ));
+
+    let get_route = Router::new()
+        .route("/v1/emails/:id", get(handlers::get_email_status))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit_middleware,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth_middleware,
         ));
 
     Router::new()
         .route("/health", get(handlers::health))
         .route("/ready", get(handlers::ready))
-        .merge(protected_routes)
+        .merge(post_route)
+        .merge(get_route)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

@@ -8,11 +8,17 @@ use uuid::Uuid;
 pub enum EmailJobStatus {
     Pending,
     Processing,
+    /// Marker set immediately before the SMTP handoff.
+    /// If a lease expires while in this state, the job becomes Ambiguous
+    /// and is NOT auto-retried (avoids duplicate sends after Postfix accepted).
+    Submitting,
     SubmittedToMta,
     Deferred,
     AcceptedByRecipientServer,
     Bounced,
     Failed,
+    /// Lease expired during Submitting — do not resend blindly.
+    Ambiguous,
 }
 
 impl std::fmt::Display for EmailJobStatus {
@@ -20,11 +26,13 @@ impl std::fmt::Display for EmailJobStatus {
         match self {
             EmailJobStatus::Pending => write!(f, "Pending"),
             EmailJobStatus::Processing => write!(f, "Processing"),
+            EmailJobStatus::Submitting => write!(f, "Submitting"),
             EmailJobStatus::SubmittedToMta => write!(f, "SubmittedToMta"),
             EmailJobStatus::Deferred => write!(f, "Deferred"),
             EmailJobStatus::AcceptedByRecipientServer => write!(f, "AcceptedByRecipientServer"),
             EmailJobStatus::Bounced => write!(f, "Bounced"),
             EmailJobStatus::Failed => write!(f, "Failed"),
+            EmailJobStatus::Ambiguous => write!(f, "Ambiguous"),
         }
     }
 }
@@ -36,11 +44,13 @@ impl std::str::FromStr for EmailJobStatus {
         match s {
             "Pending" => Ok(EmailJobStatus::Pending),
             "Processing" => Ok(EmailJobStatus::Processing),
+            "Submitting" => Ok(EmailJobStatus::Submitting),
             "SubmittedToMta" => Ok(EmailJobStatus::SubmittedToMta),
             "Deferred" => Ok(EmailJobStatus::Deferred),
             "AcceptedByRecipientServer" => Ok(EmailJobStatus::AcceptedByRecipientServer),
             "Bounced" => Ok(EmailJobStatus::Bounced),
             "Failed" => Ok(EmailJobStatus::Failed),
+            "Ambiguous" => Ok(EmailJobStatus::Ambiguous),
             _ => Err(format!("Unknown status: {}", s)),
         }
     }
@@ -64,6 +74,7 @@ pub struct EmailJob {
     pub api_key_id: Option<Uuid>,
     pub idempotency_key: Option<String>,
     pub template_data: Option<sqlx::types::JsonValue>,
+    pub next_attempt_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, FromRow)]

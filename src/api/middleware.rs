@@ -5,10 +5,10 @@ use axum::{
     response::Response,
     Json,
 };
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::auth::hash_api_key;
@@ -88,20 +88,21 @@ impl RateLimiter {
     pub async fn check(&self, key: &str) -> bool {
         let mut requests = self.requests.lock().await;
         let now = Instant::now();
-        
-        let entry = requests.entry(key.to_string()).or_insert_with(Vec::new);
-        
+
+        let entry = requests.entry(key.to_string()).or_default();
         entry.retain(|&t| now.duration_since(t) < self.window);
-        
+
         if entry.len() >= self.max_requests {
             return false;
         }
-        
+
         entry.push(now);
         true
     }
 }
 
+/// Per-key + global rate limiting. Requires auth to have run first so
+/// `api_key_id` is present in request extensions.
 pub async fn rate_limit_middleware(
     State(state): State<AppState>,
     request: Request,
@@ -111,7 +112,14 @@ pub async fn rate_limit_middleware(
         .extensions()
         .get::<Uuid>()
         .copied()
-        .unwrap_or_else(Uuid::nil);
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "Missing authenticated API key".to_string(),
+                }),
+            )
+        })?;
 
     if !state.rate_limiter.check(&api_key_id.to_string()).await {
         return Err((
@@ -131,6 +139,15 @@ pub async fn rate_limit_middleware(
         ));
     }
 
+    Ok(next.run(request).await)
+}
+
+/// Queue capacity check — applied only to POST /v1/emails.
+pub async fn queue_capacity_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     match count_pending_jobs(&state.pool).await {
         Ok(count) if count >= state.queue_capacity_limit as i64 => {
             return Err((
@@ -156,25 +173,43 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limiter() {
         let limiter = RateLimiter::new(3, Duration::from_secs(60));
-        
+
         assert!(limiter.check("user1").await);
         assert!(limiter.check("user1").await);
         assert!(limiter.check("user1").await);
         assert!(!limiter.check("user1").await);
-        
+
         assert!(limiter.check("user2").await);
     }
 
     #[tokio::test]
     async fn test_rate_limiter_expiry() {
         let limiter = RateLimiter::new(2, Duration::from_millis(100));
-        
+
         assert!(limiter.check("user1").await);
         assert!(limiter.check("user1").await);
         assert!(!limiter.check("user1").await);
-        
+
         tokio::time::sleep(Duration::from_millis(150)).await;
-        
+
         assert!(limiter.check("user1").await);
+    }
+
+    /// Regression: two different API key IDs must get separate buckets.
+    #[tokio::test]
+    async fn test_per_key_rate_limiting_separate_buckets() {
+        let limiter = RateLimiter::new(2, Duration::from_secs(60));
+
+        let key1 = Uuid::new_v4().to_string();
+        let key2 = Uuid::new_v4().to_string();
+
+        assert!(limiter.check(&key1).await);
+        assert!(limiter.check(&key1).await);
+        assert!(!limiter.check(&key1).await);
+
+        // key2 must still have its own full budget
+        assert!(limiter.check(&key2).await);
+        assert!(limiter.check(&key2).await);
+        assert!(!limiter.check(&key2).await);
     }
 }
