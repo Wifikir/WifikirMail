@@ -12,26 +12,33 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::db::{update_job_status_by_queue_id, EmailJobStatus};
 
-/// Cursor lives under StateDirectory=wifikir-mail (/var/lib/wifikir-mail).
-const CURSOR_FILE: &str = "/var/lib/wifikir-mail/mail.log.cursor";
-const LOG_PATH: &str = "/var/log/mail.log";
 const MAX_BACKOFF_SECS: u64 = 300;
 
 pub struct StatusTracker {
     pool: PgPool,
     backoff_secs: u64,
+    log_path: String,
+    cursor_path: String,
 }
 
 impl StatusTracker {
-    pub fn new(pool: PgPool, _config: Config) -> Self {
+    pub fn new(pool: PgPool, config: Config) -> Self {
         Self {
             pool,
             backoff_secs: 1,
+            log_path: config.mail_log_path,
+            cursor_path: config.cursor_path,
         }
     }
 
+    /// Apply one Postfix log line. Public for integration tests.
+    pub async fn apply_line(&self, line: &str) -> Result<bool> {
+        self.process_log_line(line).await
+    }
+
     pub async fn run(mut self) {
-        info!("Status tracker started, monitoring {}", LOG_PATH);
+        crate::metrics::METRICS.tracker_up.set(1);
+        info!("Status tracker started, monitoring {}", self.log_path);
 
         loop {
             match self.monitor_postfix_logs().await {
@@ -52,7 +59,7 @@ impl StatusTracker {
     }
 
     async fn monitor_postfix_logs(&mut self) -> Result<()> {
-        let log_path = Path::new(LOG_PATH);
+        let log_path = Path::new(&self.log_path);
 
         let (last_position, last_inode) = self.read_cursor_with_inode().await.unwrap_or((0, 0));
         info!(
@@ -64,14 +71,14 @@ impl StatusTracker {
         let metadata = file.metadata().await?;
         let current_inode = Self::get_inode(&metadata);
 
-        let mut current_position =
-            if current_inode == last_inode && last_position <= metadata.len() {
-                file.seek(std::io::SeekFrom::Start(last_position)).await?;
-                last_position
-            } else {
-                info!("Log file rotated or truncated, starting from beginning");
-                0
-            };
+        let mut current_position = if current_inode == last_inode && last_position <= metadata.len()
+        {
+            file.seek(std::io::SeekFrom::Start(last_position)).await?;
+            last_position
+        } else {
+            info!("Log file rotated or truncated, starting from beginning");
+            0
+        };
 
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
@@ -155,7 +162,7 @@ impl StatusTracker {
     }
 
     async fn read_cursor_with_inode(&self) -> Result<(u64, u64)> {
-        let content = fs::read_to_string(CURSOR_FILE).await?;
+        let content = fs::read_to_string(&self.cursor_path).await?;
         let parts: Vec<&str> = content.trim().split(',').collect();
         if parts.len() == 2 {
             Ok((parts[0].parse()?, parts[1].parse()?))
@@ -165,18 +172,18 @@ impl StatusTracker {
     }
 
     async fn save_cursor_with_inode(&self, position: u64, inode: u64) -> Result<()> {
-        if let Some(parent) = Path::new(CURSOR_FILE).parent() {
+        if let Some(parent) = Path::new(&self.cursor_path).parent() {
             fs::create_dir_all(parent).await.ok();
         }
 
-        let tmp_file = format!("{}.tmp", CURSOR_FILE);
+        let tmp_file = format!("{}.tmp", self.cursor_path);
         let mut file = fs::File::create(&tmp_file).await?;
         let content = format!("{},{}", position, inode);
         file.write_all(content.as_bytes()).await?;
         file.sync_all().await?;
         drop(file);
 
-        fs::rename(&tmp_file, CURSOR_FILE).await?;
+        fs::rename(&tmp_file, &self.cursor_path).await?;
         Ok(())
     }
 

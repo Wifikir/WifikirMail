@@ -60,28 +60,26 @@ pub fn render_template(
     }
 }
 
+fn template_source(key: &str, part: &str, fallback: &str) -> String {
+    let dir = std::env::var("TEMPLATE_DIR").unwrap_or_else(|_| "templates".to_string());
+    let path = format!("{}/{}/{}.jinja", dir, key, part);
+    std::fs::read_to_string(path).unwrap_or_else(|_| fallback.to_string())
+}
+
 fn render_email_verification(data: &EmailVerificationData) -> Result<EmailTemplate> {
     let mut env = Environment::new();
-    env.add_template("subject", "E-posta Adresinizi Doğrulayın")?;
-    env.add_template(
+    let subject_src = template_source(
+        "EmailVerification",
+        "subject",
+        "E-posta Adresinizi Doğrulayın",
+    );
+    env.add_template("subject", &subject_src)?;
+    let body_src = template_source(
+        "EmailVerification",
         "body",
-        r#"
-Merhaba,
-
-Wifikir hesabınızı oluşturduğunuz için teşekkür ederiz.
-
-E-posta adresinizi doğrulamak için aşağıdaki kodu kullanın:
-
-Doğrulama Kodu: {{ verification_code }}
-
-Bu kod 24 saat geçerlidir.
-
-Eğer bu işlemi siz yapmadıysanız, lütfen bu e-postayı görmezden gelin.
-
-Saygılarımızla,
-Wifikir Ekibi
-"#,
-    )?;
+        "Doğrulama Kodu: {{ verification_code }}",
+    );
+    env.add_template("body", &body_src)?;
 
     let subject = env.get_template("subject")?.render(())?;
     let body = env.get_template("body")?.render(data)?;
@@ -90,26 +88,10 @@ Wifikir Ekibi
 
 fn render_password_reset(data: &PasswordResetData) -> Result<EmailTemplate> {
     let mut env = Environment::new();
-    env.add_template("subject", "Şifre Sıfırlama İsteği")?;
-    env.add_template(
-        "body",
-        r#"
-Merhaba,
-
-Wifikir hesabınız için şifre sıfırlama talebinde bulundunuz.
-
-Şifrenizi sıfırlamak için aşağıdaki kodu kullanın:
-
-Sıfırlama Kodu: {{ reset_code }}
-
-Bu kod 1 saat geçerlidir.
-
-Eğer bu işlemi siz yapmadıysanız, lütfen hesabınızın güvenliğini kontrol edin.
-
-Saygılarımızla,
-Wifikir Ekibi
-"#,
-    )?;
+    let subject_src = template_source("PasswordReset", "subject", "Şifre Sıfırlama İsteği");
+    let body_src = template_source("PasswordReset", "body", "Sıfırlama Kodu: {{ reset_code }}");
+    env.add_template("subject", &subject_src)?;
+    env.add_template("body", &body_src)?;
 
     let subject = env.get_template("subject")?.render(())?;
     let body = env.get_template("body")?.render(data)?;
@@ -118,22 +100,10 @@ Wifikir Ekibi
 
 fn render_notification(data: &NotificationData) -> Result<EmailTemplate> {
     let mut env = Environment::new();
-    env.add_template("subject", "{{ subject }}")?;
-    env.add_template(
-        "body",
-        r#"
-Merhaba,
-
-Wifikir platformunda sizin için yeni bir bildirim var.
-
-{{ message }}
-
-Detaylar için lütfen hesabınıza giriş yapın.
-
-Saygılarımızla,
-Wifikir Ekibi
-"#,
-    )?;
+    let subject_src = template_source("Notification", "subject", "{{ subject }}");
+    let body_src = template_source("Notification", "body", "{{ message }}");
+    env.add_template("subject", &subject_src)?;
+    env.add_template("body", &body_src)?;
 
     let subject = env.get_template("subject")?.render(data)?;
     let body = env.get_template("body")?.render(data)?;

@@ -29,10 +29,8 @@ pub fn create_router(pool: PgPool, config: &Config) -> Router {
         Duration::from_secs(60),
     );
 
-    let global_rate_limiter = RateLimiter::new(
-        config.rate_limit_global as usize,
-        Duration::from_secs(60),
-    );
+    let global_rate_limiter =
+        RateLimiter::new(config.rate_limit_global as usize, Duration::from_secs(60));
 
     let state = AppState {
         pool,

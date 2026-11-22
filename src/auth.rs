@@ -14,10 +14,7 @@ pub fn validate_email(email: &str) -> bool {
 }
 
 pub fn validate_template_key(key: &str) -> bool {
-    matches!(
-        key,
-        "EmailVerification" | "PasswordReset" | "Notification"
-    )
+    matches!(key, "EmailVerification" | "PasswordReset" | "Notification")
 }
 
 #[cfg(test)]

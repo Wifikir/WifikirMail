@@ -132,13 +132,11 @@ pub async fn claim_pending_jobs(
     .await?;
 
     for job in &jobs {
-        sqlx::query(
-            r#"INSERT INTO email_job_status_history (job_id, status) VALUES ($1, $2)"#,
-        )
-        .bind(job.id)
-        .bind(EmailJobStatus::Processing.to_string())
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query(r#"INSERT INTO email_job_status_history (job_id, status) VALUES ($1, $2)"#)
+            .bind(job.id)
+            .bind(EmailJobStatus::Processing.to_string())
+            .execute(&mut *tx)
+            .await?;
     }
 
     tx.commit().await?;
@@ -185,22 +183,14 @@ pub async fn recover_expired_leases(pool: &PgPool) -> Result<(usize, usize)> {
 }
 
 pub async fn mark_job_submitting(pool: &PgPool, job_id: Uuid) -> Result<()> {
-    sqlx::query(
-        r#"UPDATE email_jobs SET status = $1 WHERE id = $2 AND status = $3"#,
-    )
-    .bind(EmailJobStatus::Submitting.to_string())
-    .bind(job_id)
-    .bind(EmailJobStatus::Processing.to_string())
-    .execute(pool)
-    .await?;
+    sqlx::query(r#"UPDATE email_jobs SET status = $1 WHERE id = $2 AND status = $3"#)
+        .bind(EmailJobStatus::Submitting.to_string())
+        .bind(job_id)
+        .bind(EmailJobStatus::Processing.to_string())
+        .execute(pool)
+        .await?;
 
-    record_status_change(
-        pool,
-        job_id,
-        &EmailJobStatus::Submitting.to_string(),
-        None,
-    )
-    .await?;
+    record_status_change(pool, job_id, &EmailJobStatus::Submitting.to_string(), None).await?;
     Ok(())
 }
 
@@ -250,7 +240,13 @@ pub async fn update_job_failed(pool: &PgPool, job_id: Uuid, error: &str) -> Resu
     .execute(pool)
     .await?;
 
-    record_status_change(pool, job_id, &EmailJobStatus::Failed.to_string(), Some(error)).await?;
+    record_status_change(
+        pool,
+        job_id,
+        &EmailJobStatus::Failed.to_string(),
+        Some(error),
+    )
+    .await?;
     Ok(())
 }
 
@@ -275,7 +271,13 @@ pub async fn schedule_retry(
     .execute(pool)
     .await?;
 
-    record_status_change(pool, job_id, &EmailJobStatus::Pending.to_string(), Some(error)).await?;
+    record_status_change(
+        pool,
+        job_id,
+        &EmailJobStatus::Pending.to_string(),
+        Some(error),
+    )
+    .await?;
     Ok(())
 }
 
@@ -302,12 +304,11 @@ pub async fn update_job_status_by_queue_id(
     .await?;
 
     if result.rows_affected() > 0 {
-        if let Some(job) = sqlx::query_as::<_, EmailJob>(
-            "SELECT * FROM email_jobs WHERE postfix_queue_id = $1",
-        )
-        .bind(queue_id)
-        .fetch_optional(pool)
-        .await?
+        if let Some(job) =
+            sqlx::query_as::<_, EmailJob>("SELECT * FROM email_jobs WHERE postfix_queue_id = $1")
+                .bind(queue_id)
+                .fetch_optional(pool)
+                .await?
         {
             record_status_change(pool, job.id, status, None).await?;
         }
@@ -365,6 +366,61 @@ pub async fn count_pending_jobs(pool: &PgPool) -> Result<i64> {
     Ok(count.0)
 }
 
+pub async fn insert_api_key(pool: &PgPool, name: &str, key_hash: &str) -> Result<ApiKey> {
+    let key = sqlx::query_as::<_, ApiKey>(
+        r#"
+        INSERT INTO api_keys (key_hash, name)
+        VALUES ($1, $2)
+        RETURNING *
+        "#,
+    )
+    .bind(key_hash)
+    .bind(name)
+    .fetch_one(pool)
+    .await?;
+    Ok(key)
+}
+
+pub async fn list_api_keys(pool: &PgPool) -> Result<Vec<ApiKey>> {
+    let keys = sqlx::query_as::<_, ApiKey>(r#"SELECT * FROM api_keys ORDER BY created_at DESC"#)
+        .fetch_all(pool)
+        .await?;
+    Ok(keys)
+}
+
+pub async fn revoke_api_key(pool: &PgPool, id: Uuid) -> Result<bool> {
+    let result = sqlx::query(r#"UPDATE api_keys SET is_active = false WHERE id = $1"#)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn rotate_api_key(pool: &PgPool, id: Uuid, new_hash: &str) -> Result<bool> {
+    let result =
+        sqlx::query(r#"UPDATE api_keys SET key_hash = $1, is_active = true WHERE id = $2"#)
+            .bind(new_hash)
+            .bind(id)
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn pending_queue_stats(pool: &PgPool) -> Result<(i64, i64)> {
+    let row: (i64, Option<i64>) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint,
+               EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))::bigint
+        FROM email_jobs
+        WHERE status = $1
+        "#,
+    )
+    .bind(EmailJobStatus::Pending.to_string())
+    .fetch_one(pool)
+    .await?;
+    Ok((row.0, row.1.unwrap_or(0)))
+}
+
 pub async fn verify_api_key(pool: &PgPool, key_hash: &str) -> Result<Option<ApiKey>> {
     let api_key = sqlx::query_as::<_, ApiKey>(
         r#"
@@ -377,13 +433,11 @@ pub async fn verify_api_key(pool: &PgPool, key_hash: &str) -> Result<Option<ApiK
     .await?;
 
     if api_key.is_some() {
-        sqlx::query(
-            r#"UPDATE api_keys SET last_used_at = $1 WHERE key_hash = $2"#,
-        )
-        .bind(Utc::now())
-        .bind(key_hash)
-        .execute(pool)
-        .await?;
+        sqlx::query(r#"UPDATE api_keys SET last_used_at = $1 WHERE key_hash = $2"#)
+            .bind(Utc::now())
+            .bind(key_hash)
+            .execute(pool)
+            .await?;
     }
 
     Ok(api_key)
@@ -420,7 +474,12 @@ mod tests {
     fn test_jobs_content_equal_same() {
         let data = json!({ "verification_code": "ABC" });
         let job = sample_job("a@b.com", "EmailVerification", data.clone());
-        assert!(jobs_content_equal(&job, "a@b.com", "EmailVerification", &data));
+        assert!(jobs_content_equal(
+            &job,
+            "a@b.com",
+            "EmailVerification",
+            &data
+        ));
     }
 
     #[test]

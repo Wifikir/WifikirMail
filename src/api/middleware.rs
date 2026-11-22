@@ -108,18 +108,14 @@ pub async fn rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    let api_key_id = request
-        .extensions()
-        .get::<Uuid>()
-        .copied()
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse {
-                    error: "Missing authenticated API key".to_string(),
-                }),
-            )
-        })?;
+    let api_key_id = request.extensions().get::<Uuid>().copied().ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Missing authenticated API key".to_string(),
+            }),
+        )
+    })?;
 
     if !state.rate_limiter.check(&api_key_id.to_string()).await {
         return Err((

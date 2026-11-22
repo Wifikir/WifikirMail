@@ -67,6 +67,7 @@ jobs:
     - name: Run tests
       env:
         DATABASE_URL: postgres://wifikirmail:testpassword@localhost:5432/wifikir_mail_test
+        TEST_DATABASE_URL: postgres://wifikirmail:testpassword@localhost:5432/wifikir_mail_test
       run: cargo test --verbose
     
     - name: Build release

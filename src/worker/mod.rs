@@ -15,6 +15,7 @@ use crate::db::{
     claim_pending_jobs, mark_job_submitting, recover_expired_leases, schedule_retry,
     update_job_failed, update_job_submitted,
 };
+use crate::metrics::METRICS;
 use crate::templates::render_template;
 
 /// Classification of SMTP / handoff failures for the retry policy.
@@ -80,10 +81,19 @@ impl EmailWorker {
                 error!("Failed to recover expired leases: {}", e);
             }
 
-            if let Err(e) = self.process_pending_jobs().await {
+            if let Err(e) = self.process_once().await {
                 error!("Error processing pending jobs: {}", e);
             }
         }
+    }
+
+    /// One claim-and-send cycle. Used by the loop and by integration tests.
+    pub async fn process_once(&self) -> Result<()> {
+        if let Ok((count, age)) = crate::db::pending_queue_stats(&self.pool).await {
+            METRICS.jobs_pending.set(count);
+            METRICS.oldest_pending_age_seconds.set(age);
+        }
+        self.process_pending_jobs().await
     }
 
     async fn process_pending_jobs(&self) -> Result<()> {
@@ -105,7 +115,10 @@ impl EmailWorker {
             match self.send_email(&job).await {
                 Ok(()) => {}
                 Err((kind, msg)) => {
-                    error!("Failed to send email for job {}: {} ({})", job.id, msg, kind);
+                    error!(
+                        "Failed to send email for job {}: {} ({})",
+                        job.id, msg, kind
+                    );
                     self.handle_send_error(&job, kind, &msg).await?;
                 }
             }
@@ -122,6 +135,7 @@ impl EmailWorker {
     ) -> Result<()> {
         let attempt_count = job.attempt_count + 1;
 
+        METRICS.record_outcome(outcome_label(&kind));
         match kind {
             SendErrorKind::Validation | SendErrorKind::SmtpPermanent => {
                 update_job_failed(&self.pool, job.id, msg).await?;
@@ -145,20 +159,17 @@ impl EmailWorker {
         Ok(())
     }
 
-    async fn send_email(
-        &self,
-        job: &crate::db::EmailJob,
-    ) -> Result<(), (SendErrorKind, String)> {
+    async fn send_email(&self, job: &crate::db::EmailJob) -> Result<(), (SendErrorKind, String)> {
         let template = render_template(&job.template_key, job.template_data.as_ref())
             .map_err(|e| (SendErrorKind::Validation, e.to_string()))?;
 
         let email = Message::builder()
-            .from(
-                self.config
-                    .mail_from
-                    .parse()
-                    .map_err(|e| (SendErrorKind::Validation, format!("Invalid MAIL_FROM: {}", e)))?,
-            )
+            .from(self.config.mail_from.parse().map_err(|e| {
+                (
+                    SendErrorKind::Validation,
+                    format!("Invalid MAIL_FROM: {}", e),
+                )
+            })?)
             .to(job.recipient.parse().map_err(|e| {
                 (
                     SendErrorKind::Validation,
@@ -171,15 +182,26 @@ impl EmailWorker {
 
         // Persist Submitting marker BEFORE the SMTP handoff so a lease expiry
         // mid-handoff becomes Ambiguous instead of a blind resend.
-        mark_job_submitting(&self.pool, job.id)
-            .await
-            .map_err(|e| (SendErrorKind::Validation, format!("Failed to mark submitting: {}", e)))?;
+        mark_job_submitting(&self.pool, job.id).await.map_err(|e| {
+            (
+                SendErrorKind::Validation,
+                format!("Failed to mark submitting: {}", e),
+            )
+        })?;
 
-        let mailer = SmtpTransport::builder_dangerous(&self.config.smtp_host)
-            .port(self.config.smtp_port)
-            .build();
-
-        let response = mailer.send(&email).map_err(|e| {
+        let host = self.config.smtp_host.clone();
+        let port = self.config.smtp_port;
+        // Blocking SMTP must not stall the async runtime.
+        let response = tokio::task::spawn_blocking(move || {
+            SmtpTransport::builder_dangerous(&host)
+                .port(port)
+                .timeout(Some(Duration::from_secs(15)))
+                .build()
+                .send(&email)
+        })
+        .await
+        .map_err(|e| (SendErrorKind::CannotConnect, e.to_string()))?
+        .map_err(|e| {
             let kind = classify_smtp_error_message(&e.to_string());
             (kind, e.to_string())
         })?;
@@ -219,7 +241,18 @@ impl EmailWorker {
             ));
         }
 
+        METRICS.record_outcome("accepted");
+        METRICS.worker_last_success_unix.set(Utc::now().timestamp());
         Ok(())
+    }
+}
+
+fn outcome_label(kind: &SendErrorKind) -> &'static str {
+    match kind {
+        SendErrorKind::CannotConnect => "cannot_connect",
+        SendErrorKind::SmtpTransient => "transient",
+        SendErrorKind::SmtpPermanent => "permanent",
+        SendErrorKind::Validation => "validation",
     }
 }
 
@@ -292,7 +325,8 @@ pub fn calculate_next_attempt(attempt_count: u32) -> DateTime<Utc> {
     let base_delay_secs = 60u64;
     let max_delay_secs = 3600u64;
 
-    let delay_secs = (base_delay_secs * 2u64.pow(attempt_count.saturating_sub(1))).min(max_delay_secs);
+    let delay_secs =
+        (base_delay_secs * 2u64.pow(attempt_count.saturating_sub(1))).min(max_delay_secs);
 
     let jitter = rand::thread_rng().gen_range(0..=(delay_secs / 10).max(1));
     let total_delay = delay_secs + jitter;

@@ -5,9 +5,7 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use wifikir_mail::{
-    api::create_router,
-    config::Config,
-    tracker::StatusTracker,
+    api::create_router, config::Config, metrics::METRICS, tracker::StatusTracker,
     worker::EmailWorker,
 };
 
@@ -45,6 +43,20 @@ async fn main() -> Result<()> {
 
     tokio::spawn(async move {
         tracker.run().await;
+    });
+
+    let metrics_addr = format!("{}:{}", config.metrics_host, config.metrics_port);
+    let metrics_listener = tokio::net::TcpListener::bind(&metrics_addr).await?;
+    info!(
+        "Metrics on http://{}/metrics (localhost by default)",
+        metrics_addr
+    );
+    tokio::spawn(async move {
+        let app = axum::Router::new().route(
+            "/metrics",
+            axum::routing::get(|| async { METRICS.render() }),
+        );
+        let _ = axum::serve(metrics_listener, app).await;
     });
 
     let app = create_router(pool, &config);

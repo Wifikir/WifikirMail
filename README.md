@@ -137,13 +137,47 @@ cargo clippy -- -D warnings
 cargo test
 ```
 
-## Bilinen Sınırlar / Sonraki PR'lar (production öncesi)
+## Operatörün sağladığı adresler
 
-1. API key management CLI (create/list/revoke/rotate)
-2. Prometheus `/metrics` (localhost)
-3. File-based, version-controlled templates
-4. SMTP integration tests (test SMTP server, lease/cursor recovery)
-5. VERP / asynchronous bounce handling
+| Değişken | Anlam |
+|---|---|
+| `DATABASE_URL` | PostgreSQL |
+| `SMTP_HOST` / `SMTP_PORT` | Yerel Postfix (veya test SMTP) |
+| `MAIL_FROM` | Gönderen adres |
+| `SERVER_HOST` / `SERVER_PORT` | HTTP API |
+| `METRICS_HOST` / `METRICS_PORT` | `/metrics` (varsayılan 127.0.0.1:9090) |
+| `MAIL_LOG_PATH` / `CURSOR_PATH` | Postfix log ve cursor |
+| `TEMPLATE_DIR` | `templates/` |
+
+`docker compose up -d` yalnızca Postgres’i açar. Postfix sizin sunucunuzdadır.
+
+## API anahtarı
+
+```bash
+cargo run --bin wifikir_mail_cli -- keys create --name Wifikir
+cargo run --bin wifikir_mail_cli -- keys list
+cargo run --bin wifikir_mail_cli -- keys revoke --id <uuid>
+cargo run --bin wifikir_mail_cli -- keys rotate --id <uuid>
+```
+
+Düz metin anahtar yalnızca create/rotate çıktısında bir kez yazılır.
+
+## Şablonlar ve metrikler
+
+Dosyalar: `templates/<TemplateKey>/{subject,body}.jinja`. `GET /metrics` etiketlerinde adres, UUID veya idempotency key yoktur.
+
+## Test
+
+```bash
+cargo test
+TEST_DATABASE_URL=postgres://wifikirmail:password@localhost/wifikir_mail_test cargo test --test external
+```
+
+`TEST_DATABASE_URL` yoksa `tests/external.rs` atlanır. Varsa API idempotency, sahte SMTP (kabul / 5xx / bağlantı yok) ve log satırından durum güncellemesi çalışır.
+
+## Kalan (faz 2)
+
+VERP ve asynchronous bounce. Uzak kurulum: `Jenkinsfile`.
 
 ## Bounce Handling (Faz 2)
 

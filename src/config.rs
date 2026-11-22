@@ -16,6 +16,11 @@ pub struct Config {
     pub rate_limit_global: u32,
     pub job_lease_duration_secs: i64,
     pub queue_capacity_limit: usize,
+    pub template_dir: String,
+    pub metrics_host: String,
+    pub metrics_port: u16,
+    pub mail_log_path: String,
+    pub cursor_path: String,
 }
 
 impl std::fmt::Debug for Config {
@@ -28,12 +33,20 @@ impl std::fmt::Debug for Config {
             .field("server_port", &self.server_port)
             .field("mail_from", &self.mail_from)
             .field("worker_interval_secs", &self.worker_interval_secs)
-            .field("tracker_poll_interval_secs", &self.tracker_poll_interval_secs)
+            .field(
+                "tracker_poll_interval_secs",
+                &self.tracker_poll_interval_secs,
+            )
             .field("max_attempts", &self.max_attempts)
             .field("rate_limit_per_minute", &self.rate_limit_per_minute)
             .field("rate_limit_global", &self.rate_limit_global)
             .field("job_lease_duration_secs", &self.job_lease_duration_secs)
             .field("queue_capacity_limit", &self.queue_capacity_limit)
+            .field("template_dir", &self.template_dir)
+            .field("metrics_host", &self.metrics_host)
+            .field("metrics_port", &self.metrics_port)
+            .field("mail_log_path", &self.mail_log_path)
+            .field("cursor_path", &self.cursor_path)
             .finish()
     }
 }
@@ -51,8 +64,7 @@ impl Config {
             server_port: env::var("SERVER_PORT")
                 .unwrap_or_else(|_| "8080".to_string())
                 .parse()?,
-            mail_from: env::var("MAIL_FROM")
-                .unwrap_or_else(|_| "noreply@wifikir.com".to_string()),
+            mail_from: env::var("MAIL_FROM").unwrap_or_else(|_| "noreply@wifikir.com".to_string()),
             worker_interval_secs: env::var("WORKER_INTERVAL_SECS")
                 .unwrap_or_else(|_| "10".to_string())
                 .parse()?,
@@ -74,6 +86,15 @@ impl Config {
             queue_capacity_limit: env::var("QUEUE_CAPACITY_LIMIT")
                 .unwrap_or_else(|_| "10000".to_string())
                 .parse()?,
+            template_dir: env::var("TEMPLATE_DIR").unwrap_or_else(|_| "templates".to_string()),
+            metrics_host: env::var("METRICS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+            metrics_port: env::var("METRICS_PORT")
+                .unwrap_or_else(|_| "9090".to_string())
+                .parse()?,
+            mail_log_path: env::var("MAIL_LOG_PATH")
+                .unwrap_or_else(|_| "/var/log/mail.log".to_string()),
+            cursor_path: env::var("CURSOR_PATH")
+                .unwrap_or_else(|_| "/var/lib/wifikir-mail/mail.log.cursor".to_string()),
         })
     }
 }
