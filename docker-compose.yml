@@ -1,0 +1,16 @@
+# Local dependencies only. Mail delivery still uses SMTP_HOST you configure
+# (usually Postfix on the same host, not this compose file).
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: wifikirmail
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: wifikir_mail
+    ports:
+      - "5432:5432"
+    volumes:
+      - wifikir_mail_pg:/var/lib/postgresql/data
+
+volumes:
+  wifikir_mail_pg:

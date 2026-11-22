@@ -1,0 +1,37 @@
+[Unit]
+Description=WifikirMail Transactional Email Service
+After=network.target postgresql.service postfix.service
+Requires=postgresql.service postfix.service
+
+[Service]
+Type=simple
+User=wifikirmail
+Group=wifikirmail
+WorkingDirectory=/opt/wifikir-mail
+Environment="RUST_LOG=wifikir_mail=info"
+EnvironmentFile=/etc/wifikir-mail/wifikir-mail.env
+ExecStart=/opt/wifikir-mail/bin/wifikir_mail
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+# State directory for mail.log cursor (/var/lib/wifikir-mail)
+StateDirectory=wifikir-mail
+
+# Read access to Postfix logs (/var/log/mail.log).
+# The wifikirmail user must also be in the adm group:
+#   sudo usermod -aG adm wifikirmail
+SupplementaryGroups=adm
+
+# Bounce Maildir lives under StateDirectory by default:
+#   /var/lib/wifikir-mail/bounce/{new,cur}
+# If you use another path, add it here, for example:
+# ReadWritePaths=/var/mail/wifikir-bounce
+
+[Install]
+WantedBy=multi-user.target

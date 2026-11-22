@@ -1,0 +1,42 @@
+[package]
+name = "wifikir_mail"
+version = "0.1.0"
+edition = "2021"
+default-run = "wifikir_mail"
+
+[[bin]]
+name = "wifikir_mail"
+path = "src/main.rs"
+
+[[bin]]
+name = "wifikir_mail_cli"
+path = "src/bin/wifikir_mail_cli.rs"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate"] }
+lettre = "0.11"
+minijinja = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.5", features = ["trace"] }
+anyhow = "1.0"
+sha2 = "0.10"
+hex = "0.4"
+dotenvy = "0.15"
+regex = "1.10"
+rand = "0.8"
+clap = { version = "4", features = ["derive"] }
+prometheus = { version = "0.13", default-features = false }
+once_cell = "1.19"
+
+[dev-dependencies]
+tokio-test = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tempfile = "3"
