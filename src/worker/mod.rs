@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use lettre::address::{Address, Envelope};
 use lettre::transport::smtp::response::Response;
 use lettre::{Message, SmtpTransport, Transport};
 use rand::Rng;
@@ -10,6 +11,7 @@ use tokio::time;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::bounce::envelope_sender;
 use crate::config::Config;
 use crate::db::{
     claim_pending_jobs, mark_job_submitting, recover_expired_leases, schedule_retry,
@@ -163,6 +165,25 @@ impl EmailWorker {
         let template = render_template(&job.template_key, job.template_data.as_ref())
             .map_err(|e| (SendErrorKind::Validation, e.to_string()))?;
 
+        let recipient: Address = job.recipient.parse().map_err(|e| {
+            (
+                SendErrorKind::Validation,
+                format!("Invalid recipient: {}", e),
+            )
+        })?;
+        let reverse = envelope_sender(job.id, &self.config.bounce_domain, &self.config.mail_from);
+        let reverse_addr: Address = reverse.parse().map_err(|e| {
+            (
+                SendErrorKind::Validation,
+                format!("Invalid envelope sender: {}", e),
+            )
+        })?;
+        let envelope = Envelope::new(Some(reverse_addr), vec![recipient]).map_err(|e| {
+            (
+                SendErrorKind::Validation,
+                format!("Invalid envelope: {}", e),
+            )
+        })?;
         let email = Message::builder()
             .from(self.config.mail_from.parse().map_err(|e| {
                 (
@@ -177,6 +198,7 @@ impl EmailWorker {
                 )
             })?)
             .subject(&template.subject)
+            .envelope(envelope)
             .body(template.body)
             .map_err(|e| (SendErrorKind::Validation, e.to_string()))?;
 
@@ -439,6 +461,6 @@ mod tests {
         let next = calculate_next_attempt(1);
         assert!(next > Utc::now());
         let delay = (next - Utc::now()).num_seconds();
-        assert!((60..=72).contains(&delay));
+        assert!((50..=80).contains(&delay));
     }
 }

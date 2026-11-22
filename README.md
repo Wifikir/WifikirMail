@@ -175,9 +175,11 @@ TEST_DATABASE_URL=postgres://wifikirmail:password@localhost/wifikir_mail_test ca
 
 `TEST_DATABASE_URL` yoksa `tests/external.rs` atlanır. Varsa API idempotency, sahte SMTP (kabul / 5xx / bağlantı yok) ve log satırından durum güncellemesi çalışır.
 
-## Kalan (faz 2)
+## Bounce
 
-VERP ve asynchronous bounce. Uzak kurulum: `Jenkinsfile`.
+`BOUNCE_DOMAIN` doluysa envelope sender `bounce+<job_id>@alan` olur. `BOUNCE_MAILDIR` bir Maildir ise gelen DSN işi `Bounced` yapar. İkisi de boş bırakılabilir; ilk gönderim için gerekmez. Postfix `status=bounced` satırları ayrıca log tracker ile işlenir.
+
+Uzak kurulum: `Jenkinsfile`.
 
 ## Bounce Handling (Faz 2)
 

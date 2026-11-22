@@ -21,6 +21,12 @@ pub struct Config {
     pub metrics_port: u16,
     pub mail_log_path: String,
     pub cursor_path: String,
+    /// Domain for VERP envelope sender: bounce+<job_id>@bounce_domain.
+    /// Empty disables VERP and uses MAIL_FROM as the envelope sender.
+    pub bounce_domain: String,
+    /// Maildir (with new/ and cur/) where Postfix delivers DSNs. Empty disables the reader.
+    pub bounce_maildir: String,
+    pub bounce_poll_secs: u64,
 }
 
 impl std::fmt::Debug for Config {
@@ -47,6 +53,9 @@ impl std::fmt::Debug for Config {
             .field("metrics_port", &self.metrics_port)
             .field("mail_log_path", &self.mail_log_path)
             .field("cursor_path", &self.cursor_path)
+            .field("bounce_domain", &self.bounce_domain)
+            .field("bounce_maildir", &self.bounce_maildir)
+            .field("bounce_poll_secs", &self.bounce_poll_secs)
             .finish()
     }
 }
@@ -95,6 +104,11 @@ impl Config {
                 .unwrap_or_else(|_| "/var/log/mail.log".to_string()),
             cursor_path: env::var("CURSOR_PATH")
                 .unwrap_or_else(|_| "/var/lib/wifikir-mail/mail.log.cursor".to_string()),
+            bounce_domain: env::var("BOUNCE_DOMAIN").unwrap_or_default(),
+            bounce_maildir: env::var("BOUNCE_MAILDIR").unwrap_or_default(),
+            bounce_poll_secs: env::var("BOUNCE_POLL_SECS")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()?,
         })
     }
 }

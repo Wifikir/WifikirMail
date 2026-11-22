@@ -5,8 +5,8 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use wifikir_mail::{
-    api::create_router, config::Config, metrics::METRICS, tracker::StatusTracker,
-    worker::EmailWorker,
+    api::create_router, bounce::BounceReader, config::Config, metrics::METRICS,
+    tracker::StatusTracker, worker::EmailWorker,
 };
 
 #[tokio::main]
@@ -36,6 +36,7 @@ async fn main() -> Result<()> {
 
     let worker = EmailWorker::new(pool.clone(), config.clone());
     let tracker = StatusTracker::new(pool.clone(), config.clone());
+    let bounces = BounceReader::new(pool.clone(), config.clone());
 
     tokio::spawn(async move {
         worker.run().await;
@@ -43,6 +44,10 @@ async fn main() -> Result<()> {
 
     tokio::spawn(async move {
         tracker.run().await;
+    });
+
+    tokio::spawn(async move {
+        bounces.run().await;
     });
 
     let metrics_addr = format!("{}:{}", config.metrics_host, config.metrics_port);

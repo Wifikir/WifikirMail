@@ -7,6 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use wifikir_mail::api::create_router;
 use wifikir_mail::auth::hash_api_key;
+use wifikir_mail::bounce::apply_bounce_text;
 use wifikir_mail::config::Config;
 use wifikir_mail::db::{create_email_job, get_email_job, insert_api_key};
 use wifikir_mail::tracker::StatusTracker;
@@ -98,6 +99,9 @@ fn cfg(smtp_port: u16) -> Config {
         metrics_port: 0,
         mail_log_path: "/tmp/wifikir-mail-test.log".into(),
         cursor_path: "/tmp/wifikir-mail-test.cursor".into(),
+        bounce_domain: String::new(),
+        bounce_maildir: String::new(),
+        bounce_poll_secs: 30,
     }
 }
 
@@ -288,4 +292,35 @@ async fn tracker_updates_job_from_log_line() {
     assert!(tracker.apply_line(line).await.unwrap());
     let stored = get_email_job(&pool, job.id).await.unwrap().unwrap();
     assert_eq!(stored.status, "AcceptedByRecipientServer");
+}
+
+#[tokio::test]
+async fn verp_bounce_message_marks_job() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(pool) = pool().await else {
+        eprintln!("TEST_DATABASE_URL unset; skipping verp_bounce_message_marks_job");
+        return;
+    };
+    let key = insert_api_key(&pool, "w", &hash_api_key("k-verp"))
+        .await
+        .unwrap();
+    let data = json!({ "verification_code": "ABC123" });
+    let job = create_email_job(
+        &pool,
+        key.id,
+        "user@example.com",
+        "EmailVerification",
+        "ref-verp",
+        "idem-verp",
+        &data,
+    )
+    .await
+    .unwrap();
+    let raw = format!(
+        "Delivered-To: bounce+{}@bounce.wifikir.com\r\nDiagnostic-Code: smtp; 550 user unknown\r\n\r\n",
+        job.id
+    );
+    assert!(apply_bounce_text(&pool, &raw).await.unwrap());
+    let stored = get_email_job(&pool, job.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, "Bounced");
 }

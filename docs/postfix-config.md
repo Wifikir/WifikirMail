@@ -165,15 +165,27 @@ echo "Test" | mail -s "Test" test@example.com
 
 Bu üç durum farklıdır! WifikirMail sadece 1 ve 2'yi takip edebilir. Son kullanıcının mesajı görüp görmediğini bilmek için ayrı bir mekanizma (örn: tracking pixel) gerekir.
 
-## Bounce Handling (Faz 2)
+## Bounce
 
-**Şu anki durum:** WifikirMail Postfix loglarından `status=bounced` satırlarını yakalar ve işi `Bounced` olarak işaretler. Bu SMTP seviyesindeki immediate bounce'ları (5xx hatalar) kapsar.
+İki yol vardır:
 
-**Kapsanmayanlar:**
-- Asynchronous bounce mesajları (alıcı sunucu e-postayı kabul edip sonradan geri gönderdiğinde)
-- Soft bounce sonrası final failure (Postfix deferred'dan sonra vazgeçtiğinde)
+1. **Postfix logu.** `status=deferred` geçici hatadır. Postfix denemeyi bırakınca logda `status=bounced` yazar; tracker işi `Bounced` yapar. Bu, anlık 5xx ve soft-bounce sonrası final failure’ı kapsar.
+2. **VERP.** `BOUNCE_DOMAIN` doluysa envelope sender `bounce+<job_id>@BOUNCE_DOMAIN` olur. Alıcı sunucu mesajı kabul edip sonra DSN dönerse bu adres mailbox’a düşer.
 
-**Faz 2 için planlanan:** VERP (Variable Envelope Return Path):
-- Return-Path: `bounce+{job_id}@wifikir.com`
-- Bounce mailbox'ı izle ve gelen bounce'ları job_id'ye göre eşle
-- Asynchronous bounce'ları da yakala
+`BOUNCE_DOMAIN` boşsa envelope sender `MAIL_FROM` olur. İlk gönderim için bounce alanı şart değildir.
+
+Örnek Postfix (yalnızca bounce alıcısı, açık relay değil):
+
+```
+recipient_delimiter = +
+virtual_alias_domains = bounce.wifikir.com
+virtual_alias_maps = regexp:/etc/postfix/bounce-regexp
+```
+
+`/etc/postfix/bounce-regexp`:
+
+```
+/^bounce\+.*@bounce\.wifikir\.com$/  wifikir-bounce
+```
+
+`wifikir-bounce` kullanıcısının home Maildir’i `BOUNCE_MAILDIR` ile aynı olsun (`new/` ve `cur/`). Servis bu dizini okur, DSN’den job id’yi alır ve dosyayı `cur/` altına taşır.

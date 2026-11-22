@@ -281,6 +281,37 @@ pub async fn schedule_retry(
     Ok(())
 }
 
+pub async fn mark_job_bounced(pool: &PgPool, job_id: Uuid, error: &str) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE email_jobs
+        SET status = $1, last_error = $2, completed_at = $3,
+            worker_id = NULL, locked_until = NULL
+        WHERE id = $4
+          AND status NOT IN ('Bounced', 'Failed')
+        "#,
+    )
+    .bind(EmailJobStatus::Bounced.to_string())
+    .bind(error)
+    .bind(Utc::now())
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() > 0 {
+        record_status_change(
+            pool,
+            job_id,
+            &EmailJobStatus::Bounced.to_string(),
+            Some(error),
+        )
+        .await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 pub async fn update_job_status_by_queue_id(
     pool: &PgPool,
     queue_id: &str,

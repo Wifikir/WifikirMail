@@ -28,5 +28,10 @@ StateDirectory=wifikir-mail
 #   sudo usermod -aG adm wifikirmail
 SupplementaryGroups=adm
 
+# Bounce Maildir lives under StateDirectory by default:
+#   /var/lib/wifikir-mail/bounce/{new,cur}
+# If you use another path, add it here, for example:
+# ReadWritePaths=/var/mail/wifikir-bounce
+
 [Install]
 WantedBy=multi-user.target
