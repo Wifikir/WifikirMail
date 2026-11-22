@@ -10,7 +10,7 @@ Group=wifikirmail
 WorkingDirectory=/opt/wifikir-mail
 Environment="RUST_LOG=wifikir_mail=info"
 EnvironmentFile=/etc/wifikir-mail/wifikir-mail.env
-ExecStart=/opt/wifikir-mail/wifikir_mail
+ExecStart=/opt/wifikir-mail/bin/wifikir_mail
 Restart=always
 RestartSec=10
 

@@ -40,7 +40,7 @@ WifikirMail üç ana bileşenden oluşur. **Token üretimi/doğrulaması Wifikir
 2. **Alıcı sunucu kabul etti** → `AcceptedByRecipientServer` (`status=sent`)
 3. **Inbox'a ulaştı** → **garanti edilemez**
 
-WifikirMail yalnızca 1 ve 2'yi (loglardan) gözlemleyebilir. Asynchronous bounce ve soft-bounce final failure **şu an kapsanmaz** (Faz 2: VERP).
+WifikirMail yalnızca 1 ve 2'yi (loglardan) gözlemleyebilir. Asynchronous bounce için isteğe bağlı VERP (`BOUNCE_DOMAIN` + `BOUNCE_MAILDIR`); soft-bounce final `status=bounced` log satırı tracker ile işlenir.
 
 ### Postfix'in Rolü
 
